@@ -316,6 +316,11 @@ generic_netmap_register(struct netmap_adapter *na, int enable)
 		return generic_netmap_unregister(na);
 	}
 
+	na->ifp->wanted_features &= ~NETIF_F_GRO_FRAGLIST;
+	na->ifp->wanted_features &= ~NETIF_F_GRO_UDP_FWD;
+	na->ifp->wanted_features &= ~NETIF_F_GRO_HW;
+	netdev_update_features(na->ifp);
+
 	if (na->active_fds == 0) {
 		nm_prinf("Emulated adapter for %s activated", na->name);
 		/* Do all memory allocations when (na->active_fds == 0), to

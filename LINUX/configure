@@ -121,7 +121,7 @@ drv()
 	setop driver "$@"
 }
 
-drv enable-all
+drv disable-all
 
 # drivers built by external commands (subset of driver)
 setop external_driver new driver
@@ -171,7 +171,7 @@ app()
 	setop application "$@"
 }
 # enable all by default
-app enable-all
+app disable-all
 
 prefix=/usr/local
 cc=cc

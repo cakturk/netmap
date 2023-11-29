@@ -315,11 +315,16 @@ generic_netmap_register(struct netmap_adapter *na, int enable)
 		/* This is actually an unregif. */
 		return generic_netmap_unregister(na);
 	}
-
+#ifdef NETIF_F_GRO_FRAGLIST
 	na->ifp->wanted_features &= ~NETIF_F_GRO_FRAGLIST;
+#endif
+#ifdef NETIF_F_GRO_UDP_FWD
 	na->ifp->wanted_features &= ~NETIF_F_GRO_UDP_FWD;
+#endif
+#ifdef NETIF_F_GRO_HW
 	na->ifp->wanted_features &= ~NETIF_F_GRO_HW;
 	netdev_update_features(na->ifp);
+#endif
 
 	if (na->active_fds == 0) {
 		nm_prinf("Emulated adapter for %s activated", na->name);

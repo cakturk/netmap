@@ -17,6 +17,33 @@
 #include <stdlib.h>
 #include <unistd.h>
 
+#include <arpa/inet.h>
+#include <net/ethernet.h>
+#include <netinet/in.h>
+#include <netinet/ip.h>
+#include <netinet/tcp.h>
+#include <netinet/udp.h>
+
+#define eth_hdr(p) (struct ether_header *)((unsigned char *)p)
+#define ip_hdr(p) (struct ip *)((unsigned char *)p)
+#define tcp_hdr(p) (struct tcphdr *)((unsigned char *)p)
+#define udp_hdr(p) (struct udphdr *)((unsigned char *)p)
+
+struct netports {
+	uint16_t sport;
+	uint16_t dport;
+};
+static inline struct netports *to_netports(const void *vp)
+{
+	unsigned char *p = (unsigned char *)vp;
+	return (struct netports *)(p);
+}
+
+static inline int ip_hdrlen(struct ip *ih)
+{
+	return ih->ip_hl * 4;
+}
+
 #if defined(_WIN32)
 #define BUSYWAIT
 #endif
@@ -69,7 +96,7 @@ tx_slots_avail(struct nmport_d *d)
  */
 static int
 rings_move(struct netmap_ring *rxring, struct netmap_ring *txring,
-	      u_int limit, const char *msg)
+	      u_int limit, const char *msg, u_int si, u_int di)
 {
 	u_int j, k, m = 0;
 
@@ -106,16 +133,49 @@ rings_move(struct netmap_ring *rxring, struct netmap_ring *txring,
 		}
 		ts->len = rs->len;
 		if (zerocopy) {
+			struct ether_header *eh;
+			struct ip *ih = NULL;
+			struct netports *np = NULL;
+			char sbuf[INET_ADDRSTRLEN], dbuf[INET_ADDRSTRLEN];
+			/* struct tcp *th; */
+			char *rxbuf = NETMAP_BUF(rxring, rs->buf_idx);
+			uint8_t *sh, *dh;
 			uint32_t pkt = ts->buf_idx;
 			ts->buf_idx = rs->buf_idx;
 			rs->buf_idx = pkt;
 			/* report the buffer change. */
 			ts->flags |= NS_BUF_CHANGED;
 			rs->flags |= NS_BUF_CHANGED;
+			eh = eth_hdr(rxbuf);
+			sh = eh->ether_shost;
+			dh = eh->ether_dhost;
+			switch (ntohs(eh->ether_type)) {
+			case ETHERTYPE_IP:
+				ih = ip_hdr(rxbuf + sizeof(*eh));
+				inet_ntop(AF_INET, &ih->ip_src, sbuf, sizeof(sbuf));
+				inet_ntop(AF_INET, &ih->ip_dst, dbuf, sizeof(dbuf));
+				switch (ih->ip_p) {
+				case IPPROTO_TCP:
+				case IPPROTO_UDP:
+					np = to_netports(rxbuf + sizeof(*eh) + ip_hdrlen(ih));
+					break;
+				}
+				break;
+			default:
+				goto out;
+			}
+			printf("%s ring (%u -> %u id %u -> %u) %x:%x:%x:%x:%x:%x -> %x:%x:%x:%x:%x:%x"
+			       "%s:%u -> %s:%u\n",
+			       msg, si, di, rxring->ringid, txring->ringid,
+			       sh[0], sh[1], sh[2], sh[3], sh[4], sh[5],
+			       dh[0], dh[1], dh[2], dh[3], dh[4], dh[5],
+			       sbuf, ntohs(np->sport), dbuf, ntohs(np->dport));
+out:;
 		} else {
 			char *rxbuf = NETMAP_BUF(rxring, rs->buf_idx);
 			char *txbuf = NETMAP_BUF(txring, ts->buf_idx);
 			nm_pkt_copy(rxbuf, txbuf, ts->len);
+			abort();
 		}
 		/*
 		 * Copy the NS_MOREFRAG from rs to ts, leaving any
@@ -127,6 +187,7 @@ rings_move(struct netmap_ring *rxring, struct netmap_ring *txring,
 	}
 	rxring->head = rxring->cur = j;
 	txring->head = txring->cur = k;
+	if (0)
 	if (verbose && m > 0)
 		D("%s fwd %d packets: rxring %u --> txring %u",
 		    msg, m, rxring->ringid, txring->ringid);
@@ -142,6 +203,7 @@ ports_move(struct nmport_d *src, struct nmport_d *dst, u_int limit,
 	struct netmap_ring *txring, *rxring;
 	u_int m = 0, si = src->first_rx_ring, di = dst->first_tx_ring;
 
+	/* printf("first rx %u tx %u\n", si, di); */
 	while (si <= src->last_rx_ring && di <= dst->last_tx_ring) {
 		rxring = NETMAP_RXRING(src->nifp, si);
 		txring = NETMAP_TXRING(dst->nifp, di);
@@ -153,9 +215,8 @@ ports_move(struct nmport_d *src, struct nmport_d *dst, u_int limit,
 			di++;
 			continue;
 		}
-		m += rings_move(rxring, txring, limit, msg);
+		m += rings_move(rxring, txring, limit, msg, si, di);
 	}
-
 	return (m);
 }
 
@@ -297,7 +358,7 @@ main(int argc, char **argv)
 	pollfd[1].fd = pb->fd;
 
 	D("Wait %d secs for link to come up...", wait_link);
-	sleep(wait_link);
+	/* sleep(wait_link); */
 	D("Ready to go, %s 0x%x/%d <-> %s 0x%x/%d.",
 		pa->hdr.nr_name, pa->first_rx_ring, pa->reg.nr_rx_rings,
 		pb->hdr.nr_name, pb->first_rx_ring, pb->reg.nr_rx_rings);
@@ -348,6 +409,7 @@ main(int argc, char **argv)
 		/* poll() also cause kernel to txsync/rxsync the NICs */
 		ret = poll(pollfd, 2, 2500);
 #endif /* !defined(BUSYWAIT) */
+		if (ret <= 0)
 		if (ret <= 0 || verbose)
 		    D("poll %s [0] ev %x %x rx %d@%d tx %d,"
 			     " [1] ev %x %x rx %d@%d tx %d",

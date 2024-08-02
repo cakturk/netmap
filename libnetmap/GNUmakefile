@@ -1,6 +1,6 @@
 SRCDIR ?= ../
 PREFIX ?= usr/local
-CFLAGS=-O2 -pipe -Wall -Werror
+CFLAGS=-O0 -pipe -Wall -Werror
 CFLAGS +=-g
 CFLAGS += -I $(SRCDIR)/sys
 VPATH = $(SRCDIR)/libnetmap

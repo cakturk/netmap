@@ -23,6 +23,7 @@
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
+#include "uinet_queue.h"
 
 #define eth_hdr(p) (struct ether_header *)((unsigned char *)p)
 #define ip_hdr(p) (struct ip *)((unsigned char *)p)
@@ -76,6 +77,36 @@ rx_slots_avail(struct nmport_d *d)
 	}
 
 	return tot;
+}
+
+struct flow {
+	UINET_LIST_ENTRY(flow) hash_link;
+	struct in_addr *saddr, *daddr;
+	uint16_t sport, dport;
+	uint8_t proto;
+};
+
+static UINET_LIST_HEAD(flow_head, flow);
+static struct flow_head tcp_tbl[1 << 10];
+static struct flow_head udp_tbl[1 << 10];
+
+#define nelems(x) (sizeof(x) / sizeof((x)[0]))
+
+static unsigned long flowhash(uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport)
+{
+	unsigned long sum;
+
+	sum = sip * 97 ^ dip * 97 ^ sport * 97 ^ dport * 97;
+	return sum;
+}
+
+static void flow_add(struct flow_head *fh, struct flow *f)
+{
+	unsigned long hash = flowhash(f->saddr->s_addr, f->daddr->s_addr,
+				      f->sport, f->dport);
+	struct flow_head *bkt = &fh[hash & (nelems(tcp_tbl) - 1)];
+
+	UINET_LIST_INSERT_HEAD(bkt, f, hash_link);
 }
 
 static int
@@ -159,13 +190,15 @@ rings_move(struct netmap_ring *rxring, struct netmap_ring *txring,
 				case IPPROTO_UDP:
 					np = to_netports(rxbuf + sizeof(*eh) + ip_hdrlen(ih));
 					break;
+				default:
+					goto out;
 				}
 				break;
 			default:
 				goto out;
 			}
-			printf("%s ring (%u -> %u id %u -> %u) %x:%x:%x:%x:%x:%x -> %x:%x:%x:%x:%x:%x"
-			       "%s:%u -> %s:%u\n",
+			printf("pkt: %s ring ( %u -> %u id %u -> %u ) %x:%x:%x:%x:%x:%x -> %x:%x:%x:%x:%x:%x"
+			       " %s:%u -> %s:%u\n",
 			       msg, si, di, rxring->ringid, txring->ringid,
 			       sh[0], sh[1], sh[2], sh[3], sh[4], sh[5],
 			       dh[0], dh[1], dh[2], dh[3], dh[4], dh[5],

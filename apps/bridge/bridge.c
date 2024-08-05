@@ -86,7 +86,7 @@ struct flow {
 	uint8_t proto;
 };
 
-static UINET_LIST_HEAD(flow_head, flow);
+UINET_LIST_HEAD(flow_head, flow);
 static struct flow_head tcp_tbl[1 << 10];
 static struct flow_head udp_tbl[1 << 10];
 
@@ -280,6 +280,102 @@ usage(void)
 	exit(1);
 }
 
+struct poll_port {
+	struct nmport_d *nmport;
+	struct pollfd *pfd;
+};
+
+struct ifpair {
+	struct poll_port first;
+	struct poll_port second;
+	int first_index;
+	int second_index;
+};
+
+static void
+prepare_poll(struct ifpair *ifp)
+{
+	struct pollfd *pfa, *pfb;
+	struct nmport_d *pa, *pb;
+	int n0, n1;
+
+	pfa = ifp->first.pfd;
+	pfb = ifp->second.pfd;
+	pa = ifp->first.nmport;
+	pb = ifp->second.nmport;
+
+	pfa->events = pfb->events = 0;
+	pfa->revents = pfb->revents = 0;
+	n0 = rx_slots_avail(pa);
+	n1 = rx_slots_avail(pb);
+#ifdef BUSYWAIT
+	if (n0) {
+		pfb->revents = POLLOUT;
+	} else {
+		ioctl(pfa->fd, NIOCRXSYNC, NULL);
+	}
+	if (n1) {
+		pfa->revents = POLLOUT;
+	} else {
+		ioctl(pfb->fd, NIOCRXSYNC, NULL);
+	}
+#else  /* !defined(BUSYWAIT) */
+	if (n0)
+		pfb->events |= POLLOUT;
+	else
+		pfa->events |= POLLIN;
+	if (n1)
+		pfa->events |= POLLOUT;
+	else
+		pfb->events |= POLLIN;
+
+	/* poll() also cause kernel to txsync/rxsync the NICs */
+#endif /* !defined(BUSYWAIT) */
+}
+
+static void
+do_poll(struct ifpair *ifp, u_int burst, const char *msg_a2b, const char *msg_b2a)
+{
+	struct pollfd *pfa, *pfb;
+	struct nmport_d *pa, *pb;
+
+	pfa = ifp->first.pfd;
+	pfb = ifp->second.pfd;
+	pa = ifp->first.nmport;
+	pb = ifp->second.nmport;
+
+	if (pfa->revents & POLLERR) {
+		struct netmap_ring *rx = NETMAP_RXRING(pa->nifp,
+						       pa->cur_rx_ring);
+		D("error on fd0, rx [%d,%d,%d)",
+		  rx->head, rx->cur, rx->tail);
+	}
+	if (pfb->revents & POLLERR) {
+		struct netmap_ring *rx = NETMAP_RXRING(pb->nifp,
+						       pb->cur_rx_ring);
+		D("error on fd1, rx [%d,%d,%d)",
+		  rx->head, rx->cur, rx->tail);
+	}
+	if (pfa->revents & POLLOUT) {
+		ports_move(pb, pa, burst, msg_b2a);
+#ifdef BUSYWAIT
+		ioctl(pfa->fd, NIOCTXSYNC, NULL);
+#endif
+	}
+
+	if (pfb->revents & POLLOUT) {
+		ports_move(pa, pb, burst, msg_a2b);
+#ifdef BUSYWAIT
+		ioctl(pfb->fd, NIOCTXSYNC, NULL);
+#endif
+	}
+
+	/*
+	 * We don't need ioctl(NIOCTXSYNC) on the two file descriptors.
+	 * here. The kernel will txsync on next poll().
+	 */
+}
+
 /*
  * bridge [-v] if1 [if2]
  *
@@ -290,6 +386,7 @@ usage(void)
 int
 main(int argc, char **argv)
 {
+	struct ifpair ifp;
 	char msg_a2b[256], msg_b2a[256];
 	struct pollfd pollfd[2];
 	u_int burst = 1024, wait_link = 4;
@@ -389,6 +486,16 @@ main(int argc, char **argv)
 	memset(pollfd, 0, sizeof(pollfd));
 	pollfd[0].fd = pa->fd;
 	pollfd[1].fd = pb->fd;
+	ifp = (struct ifpair) {
+		.first = {
+			.nmport = pa,
+			.pfd = &pollfd[0],
+		},
+		.second = {
+			.nmport = pb,
+			.pfd = &pollfd[1],
+		},
+	};
 
 	D("Wait %d secs for link to come up...", wait_link);
 	/* sleep(wait_link); */
@@ -413,33 +520,11 @@ main(int argc, char **argv)
 	signal(SIGINT, sigint_h);
 	while (!do_abort) {
 		int n0, n1, ret;
-		pollfd[0].events = pollfd[1].events = 0;
-		pollfd[0].revents = pollfd[1].revents = 0;
-		n0 = rx_slots_avail(pa);
-		n1 = rx_slots_avail(pb);
+
+		prepare_poll(&ifp);
 #ifdef BUSYWAIT
-		if (n0) {
-			pollfd[1].revents = POLLOUT;
-		} else {
-			ioctl(pollfd[0].fd, NIOCRXSYNC, NULL);
-		}
-		if (n1) {
-			pollfd[0].revents = POLLOUT;
-		} else {
-			ioctl(pollfd[1].fd, NIOCRXSYNC, NULL);
-		}
 		ret = 1;
 #else  /* !defined(BUSYWAIT) */
-		if (n0)
-			pollfd[1].events |= POLLOUT;
-		else
-			pollfd[0].events |= POLLIN;
-		if (n1)
-			pollfd[0].events |= POLLOUT;
-		else
-			pollfd[1].events |= POLLIN;
-
-		/* poll() also cause kernel to txsync/rxsync the NICs */
 		ret = poll(pollfd, 2, 2500);
 #endif /* !defined(BUSYWAIT) */
 		if (ret <= 0)
@@ -460,34 +545,7 @@ main(int argc, char **argv)
 			);
 		if (ret < 0)
 			continue;
-		if (pollfd[0].revents & POLLERR) {
-			struct netmap_ring *rx = NETMAP_RXRING(pa->nifp, pa->cur_rx_ring);
-			D("error on fd0, rx [%d,%d,%d)",
-			    rx->head, rx->cur, rx->tail);
-		}
-		if (pollfd[1].revents & POLLERR) {
-			struct netmap_ring *rx = NETMAP_RXRING(pb->nifp, pb->cur_rx_ring);
-			D("error on fd1, rx [%d,%d,%d)",
-			    rx->head, rx->cur, rx->tail);
-		}
-		if (pollfd[0].revents & POLLOUT) {
-			ports_move(pb, pa, burst, msg_b2a);
-#ifdef BUSYWAIT
-			ioctl(pollfd[0].fd, NIOCTXSYNC, NULL);
-#endif
-		}
-
-		if (pollfd[1].revents & POLLOUT) {
-			ports_move(pa, pb, burst, msg_a2b);
-#ifdef BUSYWAIT
-			ioctl(pollfd[1].fd, NIOCTXSYNC, NULL);
-#endif
-		}
-
-		/*
-		 * We don't need ioctl(NIOCTXSYNC) on the two file descriptors.
-		 * here. The kernel will txsync on next poll().
-		 */
+		do_poll(&ifp, burst, msg_a2b, msg_b2a);
 	}
 	nmport_close(pb);
 	nmport_close(pa);

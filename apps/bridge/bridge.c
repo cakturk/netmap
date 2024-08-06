@@ -376,6 +376,51 @@ do_poll(struct ifpair *ifp, u_int burst, const char *msg_a2b, const char *msg_b2
 	 */
 }
 
+static int
+scan_ifp(struct ifpair *ifplist, int npair)
+{
+	int i;
+
+	for (i = 0; i < npair; i++) {
+		struct ifpair *ifp = &ifplist[i];
+		struct pollfd *pfa = ifp->first.pfd;
+		struct pollfd *pfb = ifp->second.pfd;
+
+		if (pfa->revents & POLLERR)
+			goto gotevent;
+		if (pfb->revents & POLLERR)
+			goto gotevent;
+		if (pfa->revents & POLLOUT)
+			goto gotevent;
+		if (pfb->revents & POLLOUT)
+			goto gotevent;
+	}
+	return -1;
+gotevent:
+	return i & ~0x1U;
+}
+
+/*
+ * scans the pollfds and returns the ifpair index
+ */
+static int
+scan_pollfds(struct pollfd *pfds, int nfds)
+{
+	int i;
+
+	for (i = 0; i < nfds; i++) {
+		struct pollfd *p = &pfds[i];
+
+		/* look for a writable slot in the dst ring */
+		if (p->revents & POLLERR)
+			return i & ~0x1U;
+
+		if (p->revents & POLLOUT)
+			return i & ~0x1U;
+	}
+	return -1;
+}
+
 /*
  * bridge [-v] if1 [if2]
  *
@@ -386,7 +431,7 @@ do_poll(struct ifpair *ifp, u_int burst, const char *msg_a2b, const char *msg_b2
 int
 main(int argc, char **argv)
 {
-	struct ifpair ifp;
+	/* struct ifpair ifps[1]; */
 	char msg_a2b[256], msg_b2a[256];
 	struct pollfd pollfd[2];
 	u_int burst = 1024, wait_link = 4;
@@ -396,8 +441,10 @@ main(int argc, char **argv)
 	int pa_sw_rings, pb_sw_rings;
 	int loopback = 0;
 	int ch;
+	char *ifs[16];
+	int nqueues = 0, nifps = 0;
 
-	while ((ch = getopt(argc, argv, "hb:ci:vw:L")) != -1) {
+	while ((ch = getopt(argc, argv, "hb:ci:q:vw:L")) != -1) {
 		switch (ch) {
 		default:
 			D("bad option %c %s", ch, optarg);
@@ -419,6 +466,9 @@ main(int argc, char **argv)
 			break;
 		case 'c':
 			zerocopy = 0; /* do not zerocopy */
+			break;
+		case 'q':
+			nqueues = atoi(optarg);
 			break;
 		case 'v':
 			verbose++;
@@ -486,16 +536,19 @@ main(int argc, char **argv)
 	memset(pollfd, 0, sizeof(pollfd));
 	pollfd[0].fd = pa->fd;
 	pollfd[1].fd = pb->fd;
-	ifp = (struct ifpair) {
-		.first = {
-			.nmport = pa,
-			.pfd = &pollfd[0],
-		},
-		.second = {
-			.nmport = pb,
-			.pfd = &pollfd[1],
+	struct ifpair ifps[] = {
+		{
+			.first = {
+				.nmport = pa,
+				.pfd = &pollfd[0],
+			},
+			.second = {
+				.nmport = pb,
+				.pfd = &pollfd[1],
+			},
 		},
 	};
+	nifps = 1;
 
 	D("Wait %d secs for link to come up...", wait_link);
 	/* sleep(wait_link); */
@@ -519,9 +572,10 @@ main(int argc, char **argv)
 	/* main loop */
 	signal(SIGINT, sigint_h);
 	while (!do_abort) {
-		int n0, n1, ret;
+		int n0, n1, ret, i;
 
-		prepare_poll(&ifp);
+		for (i = 0; i < nifps; i++)
+			prepare_poll(&ifps[i]);
 #ifdef BUSYWAIT
 		ret = 1;
 #else  /* !defined(BUSYWAIT) */
@@ -545,7 +599,8 @@ main(int argc, char **argv)
 			);
 		if (ret < 0)
 			continue;
-		do_poll(&ifp, burst, msg_a2b, msg_b2a);
+		for (i = 0; i < nifps; i++)
+			do_poll(&ifps[i], burst, msg_a2b, msg_b2a);
 	}
 	nmport_close(pb);
 	nmport_close(pa);

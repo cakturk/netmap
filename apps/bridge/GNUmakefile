@@ -10,9 +10,10 @@ VPATH = $(SRCDIR)/apps/bridge
 
 NO_MAN=
 CFLAGS = -O2 -pipe
-CFLAGS += -Wall -Wunused-function
+CFLAGS += -Wall
 CFLAGS += -I $(SRCDIR)/sys -I $(SRCDIR)/apps/include -I$(SRCDIR)/libnetmap
-CFLAGS += -Wextra
+CFLAGS += -Wno-unused-variable -Wno-unused-function
+# CFLAGS += -Wextra
 
 LDFLAGS += -L $(BUILDDIR)/build-libnetmap
 $(info ldflags: $(LDFLAGS))

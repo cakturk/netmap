@@ -11,11 +11,13 @@
 
 #include <libnetmap.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/poll.h>
 #include <sys/ioctl.h>
-#include <stdlib.h>
 #include <unistd.h>
+#include <errno.h>
 
 #include <arpa/inet.h>
 #include <net/ethernet.h>
@@ -53,6 +55,7 @@ static int verbose = 0;
 
 static int do_abort = 0;
 static int zerocopy = 1; /* enable zerocopy if possible */
+static int worker_id;
 
 static void
 sigint_h(int sig)
@@ -197,9 +200,9 @@ rings_move(struct netmap_ring *rxring, struct netmap_ring *txring,
 			default:
 				goto out;
 			}
-			printf("pkt: %s ring ( %u -> %u id %u -> %u ) %x:%x:%x:%x:%x:%x -> %x:%x:%x:%x:%x:%x"
+			printf("pkt: inst %d %s ring ( %u -> %u id %u -> %u ) %x:%x:%x:%x:%x:%x -> %x:%x:%x:%x:%x:%x"
 			       " %s:%u -> %s:%u\n",
-			       msg, si, di, rxring->ringid, txring->ringid,
+			       worker_id, msg, si, di, rxring->ringid, txring->ringid,
 			       sh[0], sh[1], sh[2], sh[3], sh[4], sh[5],
 			       dh[0], dh[1], dh[2], dh[3], dh[4], dh[5],
 			       sbuf, ntohs(np->sport), dbuf, ntohs(np->dport));
@@ -421,6 +424,50 @@ scan_pollfds(struct pollfd *pfds, int nfds)
 	return -1;
 }
 
+static void
+die(const char *fmt, ...)
+{
+	va_list params;
+
+	va_start(params, fmt);
+	vfprintf(stderr, fmt, params);
+	va_end(params);
+}
+
+static pid_t
+fork_or_die(void)
+{
+	pid_t pid;
+
+	pid = fork();
+	switch (pid) {
+	case 0:
+		break;
+	case -1:
+		die("failed to fork: %s (%d)\n", strerror(errno), errno);
+	default:
+	}
+	return pid;
+}
+
+static pid_t worker_pids[8];
+
+static void
+spawn_workers(int n)
+{
+	pid_t pid;
+	int i;
+
+	for (i = 0; i < n; i++) {
+		pid = fork_or_die();
+		worker_id++;
+		if (pid > 0) {
+			return;
+		}
+		printf("worker %d spawned pid %d\n", worker_id, getpid());
+	}
+}
+
 /*
  * bridge [-v] if1 [if2]
  *
@@ -517,6 +564,7 @@ main(int argc, char **argv)
 	} else {
 		/* two different interfaces. Take all rings on if1 */
 	}
+
 	pa = nmport_open(ifa);
 	if (pa == NULL) {
 		D("cannot open %s", ifa);
@@ -568,6 +616,9 @@ main(int argc, char **argv)
 	snprintf(msg_b2a, sizeof(msg_b2a), "%s:%s --> %s:%s",
 			pb->hdr.nr_name, pb_sw_rings ? "host" : "nic",
 			pa->hdr.nr_name, pa_sw_rings ? "host" : "nic");
+
+	spawn_workers(4);
+	sleep(10);
 
 	/* main loop */
 	signal(SIGINT, sigint_h);

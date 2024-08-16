@@ -12,10 +12,16 @@
 #include <libnetmap.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <sys/poll.h>
 #include <sys/ioctl.h>
 #include <stdlib.h>
+#include <pthread.h>
 #include <unistd.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <errno.h>
 
 #include <arpa/inet.h>
 #include <net/ethernet.h>
@@ -30,6 +36,8 @@
 #define tcp_hdr(p) (struct tcphdr *)((unsigned char *)p)
 #define udp_hdr(p) (struct udphdr *)((unsigned char *)p)
 
+#define __unused __attribute__((__unused__))
+
 struct netports {
 	uint16_t sport;
 	uint16_t dport;
@@ -43,6 +51,16 @@ static inline struct netports *to_netports(const void *vp)
 static inline int ip_hdrlen(struct ip *ih)
 {
 	return ih->ip_hl * 4;
+}
+
+static void
+die(const char *fmt, ...)
+{
+	va_list params;
+
+	va_start(params, fmt);
+	vfprintf(stderr, fmt, params);
+	va_end(params);
 }
 
 #if defined(_WIN32)
@@ -87,8 +105,8 @@ struct flow {
 };
 
 UINET_LIST_HEAD(flow_head, flow);
-static struct flow_head tcp_tbl[1 << 10];
-static struct flow_head udp_tbl[1 << 10];
+static struct flow_head __unused tcp_tbl[1 << 10];
+static struct flow_head __unused udp_tbl[1 << 10];
 
 #define nelems(x) (sizeof(x) / sizeof((x)[0]))
 
@@ -100,7 +118,7 @@ static unsigned long flowhash(uint32_t sip, uint32_t dip, uint16_t sport, uint16
 	return sum;
 }
 
-static void flow_add(struct flow_head *fh, struct flow *f)
+static void __unused flow_add(struct flow_head *fh, struct flow *f)
 {
 	unsigned long hash = flowhash(f->saddr->s_addr, f->daddr->s_addr,
 				      f->sport, f->dport);
@@ -119,6 +137,61 @@ tx_slots_avail(struct nmport_d *d)
 	}
 
 	return tot;
+}
+
+#define FRAME_SIZE 1500
+#define BUFFER_SIZE 10
+#define NUM_ITEMS 20
+
+typedef struct {
+	int buffer[FRAME_SIZE*1024];
+	int count;
+	int in;
+	int out;
+	pthread_mutex_t mutex;
+	pthread_cond_t not_empty;
+	pthread_cond_t not_full;
+} shared_data_t;
+
+static shared_data_t *shared_data;
+
+static void
+mem_init(int nconsumer)
+{
+	int fd = shm_open("/shared_memory", O_CREAT | O_RDWR, 0666);
+	ftruncate(fd, sizeof(shared_data_t));
+
+	shared_data = mmap(NULL, sizeof(shared_data_t) * nconsumer,
+			   PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (shared_data == MAP_FAILED)
+		die("%s: failed to mmap shared mem\n", __func__);
+	close(fd);
+
+	shared_data->count = 0;
+	shared_data->in = 0;
+	shared_data->out = 0;
+	pthread_mutexattr_t mutex_attr;
+	pthread_condattr_t cond_attr;
+
+	pthread_mutexattr_init(&mutex_attr);
+	pthread_mutexattr_setpshared(&mutex_attr, PTHREAD_PROCESS_SHARED);
+	pthread_mutexattr_setrobust(&mutex_attr, PTHREAD_MUTEX_ROBUST);
+	pthread_mutex_init(&shared_data->mutex, &mutex_attr);
+
+	pthread_condattr_init(&cond_attr);
+	pthread_condattr_setpshared(&cond_attr, PTHREAD_PROCESS_SHARED);
+	pthread_cond_init(&shared_data->not_empty, &cond_attr);
+	pthread_cond_init(&shared_data->not_full, &cond_attr);
+}
+
+static void
+mem_destroy(void)
+{
+	pthread_mutex_destroy(&shared_data->mutex);
+	pthread_cond_destroy(&shared_data->not_empty);
+	pthread_cond_destroy(&shared_data->not_full);
+	munmap(shared_data, sizeof(shared_data_t));
+	shm_unlink("/shared_memory");
 }
 
 /*
@@ -208,7 +281,6 @@ out:;
 			char *rxbuf = NETMAP_BUF(rxring, rs->buf_idx);
 			char *txbuf = NETMAP_BUF(txring, ts->buf_idx);
 			nm_pkt_copy(rxbuf, txbuf, ts->len);
-			abort();
 		}
 		/*
 		 * Copy the NS_MOREFRAG from rs to ts, leaving any
@@ -376,7 +448,7 @@ do_poll(struct ifpair *ifp, u_int burst, const char *msg_a2b, const char *msg_b2
 	 */
 }
 
-static int
+static int __unused
 scan_ifp(struct ifpair *ifplist, int npair)
 {
 	int i;
@@ -401,27 +473,6 @@ gotevent:
 }
 
 /*
- * scans the pollfds and returns the ifpair index
- */
-static int
-scan_pollfds(struct pollfd *pfds, int nfds)
-{
-	int i;
-
-	for (i = 0; i < nfds; i++) {
-		struct pollfd *p = &pfds[i];
-
-		/* look for a writable slot in the dst ring */
-		if (p->revents & POLLERR)
-			return i & ~0x1U;
-
-		if (p->revents & POLLOUT)
-			return i & ~0x1U;
-	}
-	return -1;
-}
-
-/*
  * bridge [-v] if1 [if2]
  *
  * If only one name, or the two interfaces are the same,
@@ -441,8 +492,7 @@ main(int argc, char **argv)
 	int pa_sw_rings, pb_sw_rings;
 	int loopback = 0;
 	int ch;
-	char *ifs[16];
-	int nqueues = 0, nifps = 0;
+	int __unused nqueues = 0, nifps = 0;
 
 	while ((ch = getopt(argc, argv, "hb:ci:q:vw:L")) != -1) {
 		switch (ch) {
@@ -517,6 +567,7 @@ main(int argc, char **argv)
 	} else {
 		/* two different interfaces. Take all rings on if1 */
 	}
+	mem_init(3);
 	pa = nmport_open(ifa);
 	if (pa == NULL) {
 		D("cannot open %s", ifa);
@@ -572,7 +623,7 @@ main(int argc, char **argv)
 	/* main loop */
 	signal(SIGINT, sigint_h);
 	while (!do_abort) {
-		int n0, n1, ret, i;
+		int ret, i;
 
 		for (i = 0; i < nifps; i++)
 			prepare_poll(&ifps[i]);
@@ -604,6 +655,7 @@ main(int argc, char **argv)
 	}
 	nmport_close(pb);
 	nmport_close(pa);
+	mem_destroy();
 
 	return (0);
 }

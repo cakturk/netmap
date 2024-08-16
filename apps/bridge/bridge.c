@@ -10,18 +10,19 @@
  */
 
 #include <libnetmap.h>
-#include <signal.h>
-#include <stdio.h>
-#include <stdarg.h>
-#include <sys/poll.h>
-#include <sys/ioctl.h>
-#include <stdlib.h>
-#include <pthread.h>
-#include <unistd.h>
-#include <sys/mman.h>
-#include <fcntl.h>
-#include <sys/wait.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/poll.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include <arpa/inet.h>
 #include <net/ethernet.h>
@@ -159,8 +160,9 @@ static void
 mem_init(int nconsumer)
 {
 	int fd = shm_open("/shared_memory", O_CREAT | O_RDWR, 0666);
-	ftruncate(fd, sizeof(shared_data_t));
 
+	if (ftruncate(fd, sizeof(shared_data_t)) != 0)
+		die("failed to ftruncate\n");
 	shared_data = mmap(NULL, sizeof(shared_data_t) * nconsumer,
 			   PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 	if (shared_data == MAP_FAILED)
@@ -200,7 +202,7 @@ mem_destroy(void)
  */
 static int
 rings_move(struct netmap_ring *rxring, struct netmap_ring *txring,
-	      u_int limit, const char *msg, u_int si, u_int di)
+	   u_int limit, const char *msg)
 {
 	u_int j, k, m = 0;
 
@@ -241,6 +243,7 @@ rings_move(struct netmap_ring *rxring, struct netmap_ring *txring,
 			struct ip *ih = NULL;
 			struct netports *np = NULL;
 			char sbuf[INET_ADDRSTRLEN], dbuf[INET_ADDRSTRLEN];
+			int proto = 0;
 			/* struct tcp *th; */
 			char *rxbuf = NETMAP_BUF(rxring, rs->buf_idx);
 			uint8_t *sh, *dh;
@@ -260,7 +263,10 @@ rings_move(struct netmap_ring *rxring, struct netmap_ring *txring,
 				inet_ntop(AF_INET, &ih->ip_dst, dbuf, sizeof(dbuf));
 				switch (ih->ip_p) {
 				case IPPROTO_TCP:
+					proto++;
+					/* fallthrough */
 				case IPPROTO_UDP:
+					proto++;
 					np = to_netports(rxbuf + sizeof(*eh) + ip_hdrlen(ih));
 					break;
 				default:
@@ -270,9 +276,10 @@ rings_move(struct netmap_ring *rxring, struct netmap_ring *txring,
 			default:
 				goto out;
 			}
-			printf("pkt: %s ring ( %u -> %u id %u -> %u ) %x:%x:%x:%x:%x:%x -> %x:%x:%x:%x:%x:%x"
+			printf("pkt: %s ring ( id %u -> %u ) %s%x:%x:%x:%x:%x:%x -> %x:%x:%x:%x:%x:%x"
 			       " %s:%u -> %s:%u\n",
-			       msg, si, di, rxring->ringid, txring->ringid,
+			       msg, rxring->ringid, txring->ringid,
+			       proto == 1 ? "udp " : proto == 2 ? "tcp " : "",
 			       sh[0], sh[1], sh[2], sh[3], sh[4], sh[5],
 			       dh[0], dh[1], dh[2], dh[3], dh[4], dh[5],
 			       sbuf, ntohs(np->sport), dbuf, ntohs(np->dport));
@@ -320,7 +327,7 @@ ports_move(struct nmport_d *src, struct nmport_d *dst, u_int limit,
 			di++;
 			continue;
 		}
-		m += rings_move(rxring, txring, limit, msg, si, di);
+		m += rings_move(rxring, txring, limit, msg);
 	}
 	return (m);
 }

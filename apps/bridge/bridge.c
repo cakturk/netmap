@@ -159,8 +159,10 @@ static shared_data_t *shared_data;
 static void
 mem_init(int nconsumer)
 {
-	int fd = shm_open("/shared_memory", O_CREAT | O_RDWR, 0666);
+	int fd = shm_open("/pkt_memory", O_CREAT | O_RDWR, 0666);
 
+	if (fd < 0)
+		die("failed to shm_open\n");
 	if (ftruncate(fd, sizeof(shared_data_t)) != 0)
 		die("failed to ftruncate\n");
 	shared_data = mmap(NULL, sizeof(shared_data_t) * nconsumer,
@@ -193,7 +195,7 @@ mem_destroy(void)
 	pthread_cond_destroy(&shared_data->not_empty);
 	pthread_cond_destroy(&shared_data->not_full);
 	munmap(shared_data, sizeof(shared_data_t));
-	shm_unlink("/shared_memory");
+	shm_unlink("/pkt_memory");
 }
 
 /*
@@ -279,7 +281,7 @@ rings_move(struct netmap_ring *rxring, struct netmap_ring *txring,
 			printf("pkt: %s ring ( id %u -> %u ) %s%x:%x:%x:%x:%x:%x -> %x:%x:%x:%x:%x:%x"
 			       " %s:%u -> %s:%u\n",
 			       msg, rxring->ringid, txring->ringid,
-			       proto == 1 ? "udp " : proto == 2 ? "tcp " : "",
+			       proto == 1 ? "udp " : proto == 2 ? "tcp " : "n/a",
 			       sh[0], sh[1], sh[2], sh[3], sh[4], sh[5],
 			       dh[0], dh[1], dh[2], dh[3], dh[4], dh[5],
 			       sbuf, ntohs(np->sport), dbuf, ntohs(np->dport));

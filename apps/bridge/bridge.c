@@ -31,6 +31,7 @@
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
 #include "uinet_queue.h"
+#include "ring.h"
 
 #define eth_hdr(p) (struct ether_header *)((unsigned char *)p)
 #define ip_hdr(p) (struct ip *)((unsigned char *)p)
@@ -153,6 +154,34 @@ typedef struct {
 	pthread_cond_t not_empty;
 	pthread_cond_t not_full;
 } shared_data_t;
+
+struct pkt_ring {
+	pthread_mutex_t p_mtx;
+	pthread_cond_t p_wake;
+	struct ring *p_ring;
+};
+
+static void
+pkt_ring_init(struct pkt_ring *pr, void *buf, size_t size, size_t nmemb)
+{
+	pthread_mutexattr_t mutex_attr;
+	pthread_condattr_t cond_attr;
+
+	pthread_mutexattr_init(&mutex_attr);
+	pthread_mutexattr_setpshared(&mutex_attr, PTHREAD_PROCESS_SHARED);
+	pthread_mutexattr_setrobust(&mutex_attr, PTHREAD_MUTEX_ROBUST);
+	pthread_mutex_init(&pr->p_mtx, &mutex_attr);
+
+	pthread_condattr_init(&cond_attr);
+	pthread_condattr_setpshared(&cond_attr, PTHREAD_PROCESS_SHARED);
+	pthread_cond_init(&pr->p_wake, &cond_attr);
+}
+
+static void
+pkt_ring_wake(struct pkt_ring *pr)
+{
+	pthread_cond_signal(&pr->p_wake);
+}
 
 static shared_data_t *shared_data;
 

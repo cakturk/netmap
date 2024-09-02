@@ -65,6 +65,20 @@ die(const char *fmt, ...)
 	va_end(params);
 }
 
+static pid_t fork_or_die(void)
+{
+	pid_t pid;
+
+	switch ((pid = fork())) {
+	case 0:
+		break;
+	case -1:
+		die("unable to fork: %s", strerror(errno));
+	default:
+	}
+	return pid;
+}
+
 #if defined(_WIN32)
 #define BUSYWAIT
 #endif
@@ -158,7 +172,12 @@ typedef struct {
 struct pkt_ring {
 	pthread_mutex_t p_mtx;
 	pthread_cond_t p_wake;
-	struct ring *p_ring;
+	struct ring p_ring;
+};
+
+struct pkt_ipc_ring {
+	struct pkt_ring pi_tx;
+	struct pkt_ring pi_rx;
 };
 
 static void
@@ -175,6 +194,8 @@ pkt_ring_init(struct pkt_ring *pr, void *buf, size_t size, size_t nmemb)
 	pthread_condattr_init(&cond_attr);
 	pthread_condattr_setpshared(&cond_attr, PTHREAD_PROCESS_SHARED);
 	pthread_cond_init(&pr->p_wake, &cond_attr);
+
+	ring_init(&pr->p_ring);
 }
 
 static void
@@ -183,48 +204,70 @@ pkt_ring_wake(struct pkt_ring *pr)
 	pthread_cond_signal(&pr->p_wake);
 }
 
-static shared_data_t *shared_data;
-
-static void
+static void *
 mem_init(int nconsumer)
 {
-	int fd = shm_open("/pkt_memory", O_CREAT | O_RDWR, 0666);
+	struct pkt_ipc_ring *ipr;
+	int fd;
 
-	if (fd < 0)
+	if ((fd = shm_open("/pkt_memory", O_CREAT | O_RDWR, 0666)) < 0)
 		die("failed to shm_open\n");
-	if (ftruncate(fd, sizeof(shared_data_t)) != 0)
+	if (ftruncate(fd, sizeof(struct pkt_ipc_ring) * nconsumer) != 0)
 		die("failed to ftruncate\n");
-	shared_data = mmap(NULL, sizeof(shared_data_t) * nconsumer,
-			   PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-	if (shared_data == MAP_FAILED)
+	ipr = mmap(NULL, sizeof(struct pkt_ipc_ring) * nconsumer,
+		      PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (ipr == MAP_FAILED)
 		die("%s: failed to mmap shared mem\n", __func__);
 	close(fd);
 
-	shared_data->count = 0;
-	shared_data->in = 0;
-	shared_data->out = 0;
-	pthread_mutexattr_t mutex_attr;
-	pthread_condattr_t cond_attr;
+	pkt_ring_init(&ipr->pi_tx, NULL, 0, 0);
+	pkt_ring_init(&ipr->pi_rx, NULL, 0, 0);
 
-	pthread_mutexattr_init(&mutex_attr);
-	pthread_mutexattr_setpshared(&mutex_attr, PTHREAD_PROCESS_SHARED);
-	pthread_mutexattr_setrobust(&mutex_attr, PTHREAD_MUTEX_ROBUST);
-	pthread_mutex_init(&shared_data->mutex, &mutex_attr);
-
-	pthread_condattr_init(&cond_attr);
-	pthread_condattr_setpshared(&cond_attr, PTHREAD_PROCESS_SHARED);
-	pthread_cond_init(&shared_data->not_empty, &cond_attr);
-	pthread_cond_init(&shared_data->not_full, &cond_attr);
+	return ipr;
 }
 
 static void
-mem_destroy(void)
+mem_destroy(void *shmem, int nrconsumer)
 {
-	pthread_mutex_destroy(&shared_data->mutex);
-	pthread_cond_destroy(&shared_data->not_empty);
-	pthread_cond_destroy(&shared_data->not_full);
-	munmap(shared_data, sizeof(shared_data_t));
+	struct pkt_ring *shring;
+
+	shring = shmem;
+	pthread_mutex_destroy(&shring->p_mtx);
+	pthread_cond_destroy(&shring->p_wake);
+	munmap(shring, sizeof(struct pkt_ring) * 2 * nrconsumer);
 	shm_unlink("/pkt_memory");
+}
+
+static void parent_proc(void *shdata)
+{
+	char buf[1500];
+	int got;
+	struct pkt_ipc_ring *ipr = shdata;
+	struct ring *r = &ipr->pi_rx.p_ring;
+
+	printf("parent running %d\n", getpid());
+	printf("ring len: tx %lu rx %lu\n", ring_len(&ipr->pi_rx.p_ring), ring_len(&ipr->pi_tx.p_ring));
+
+	pthread_mutex_lock(&ipr->pi_rx.p_mtx);
+	while (ring_len(&ipr->pi_rx.p_ring) <= 0) {
+		pthread_cond_wait(&ipr->pi_rx.p_wake, &ipr->pi_rx.p_mtx);
+	}
+	pthread_mutex_unlock(&ipr->pi_rx.p_mtx);
+	got = ring_get(r, buf, 16);
+	printf("parent: parent woken up got %d '%.*s'\n", got, 17, buf);
+}
+
+static void child_proc(void *shdata)
+{
+	struct pkt_ipc_ring *ipr = shdata;
+	struct ring *r = &ipr->pi_rx.p_ring;
+
+	ring_put(r, "this is message", 16);
+	/* strcpy(p, "this is message"); */
+	printf("child: wake parent\n");
+	pthread_mutex_lock(&ipr->pi_rx.p_mtx);
+	pthread_cond_signal(&ipr->pi_rx.p_wake);
+	pthread_mutex_unlock(&ipr->pi_rx.p_mtx);
 }
 
 /*
@@ -531,6 +574,7 @@ main(int argc, char **argv)
 	int loopback = 0;
 	int ch;
 	int __unused nqueues = 0, nifps = 0;
+	void *shmem;
 
 	while ((ch = getopt(argc, argv, "hb:ci:q:vw:L")) != -1) {
 		switch (ch) {
@@ -605,7 +649,7 @@ main(int argc, char **argv)
 	} else {
 		/* two different interfaces. Take all rings on if1 */
 	}
-	mem_init(3);
+	shmem = mem_init(4);
 	pa = nmport_open(ifa);
 	if (pa == NULL) {
 		D("cannot open %s", ifa);
@@ -693,7 +737,7 @@ main(int argc, char **argv)
 	}
 	nmport_close(pb);
 	nmport_close(pa);
-	mem_destroy();
+	mem_destroy(shmem, 4);
 
 	return (0);
 }

@@ -40,7 +40,7 @@ struct ring_pkt {
 struct ring {
 	unsigned int r;
 	unsigned int w;
-	char buf[1024][1500];
+	char buf[1024][2048];
 };
 
 static inline void ring_init(struct ring *r)

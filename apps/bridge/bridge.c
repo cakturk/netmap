@@ -405,6 +405,9 @@ static void print_pkt(char *rxbuf, const char *msg, uint16_t rx_ring,
 	int proto = 0;
 	uint8_t *sh, *dh;
 
+	if (!verbose)
+		return;
+
 	eh = eth_hdr(rxbuf);
 	sh = eh->ether_shost;
 	dh = eh->ether_dhost;
@@ -490,11 +493,17 @@ rings_move(struct netmap_ring *rxring, struct netmap_ring *txring,
 			rs->flags |= NS_BUF_CHANGED;
 			print_pkt(rxbuf, msg, rxring->ringid, txring->ringid);
 		} else {
+			struct ring *r = &ipr->pi_rx.p_ring;
 			char *rxbuf = NETMAP_BUF(rxring, rs->buf_idx);
 			char *txbuf = NETMAP_BUF(txring, ts->buf_idx);
+			char p[1514];
 
+			ring_put(r, rxbuf, ts->len);
+			/* ring_get(r, p, ts->len); */
+			/* memcpy(p, rxbuf, ts->len); */
+			ring_get(r, txbuf, ts->len);
 			print_pkt(rxbuf, msg, rxring->ringid, txring->ringid);
-			nm_pkt_copy(rxbuf, txbuf, ts->len);
+			/* nm_pkt_copy(p, txbuf, ts->len); */
 		}
 		/*
 		 * Copy the NS_MOREFRAG from rs to ts, leaving any

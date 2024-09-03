@@ -40,10 +40,29 @@
 
 #define __unused __attribute__((__unused__))
 
+struct ifpair;
+
+static void prepare_poll(struct ifpair *ifp);
+static void do_poll(struct ifpair *ifp, u_int burst, const char *msg_a2b,
+		    const char *msg_b2a);
+
+struct poll_port {
+	struct nmport_d *nmport;
+	struct pollfd *pfd;
+};
+
+struct ifpair {
+	struct poll_port first;
+	struct poll_port second;
+	int first_index;
+	int second_index;
+};
+
 struct netports {
 	uint16_t sport;
 	uint16_t dport;
 };
+
 static inline struct netports *to_netports(const void *vp)
 {
 	unsigned char *p = (unsigned char *)vp;
@@ -270,6 +289,108 @@ static void child_proc(void *shdata)
 	pthread_mutex_unlock(&ipr->pi_rx.p_mtx);
 }
 
+static void producer_proc(void *shdata, const char *ifa, const char *ifb)
+{
+	char msg_a2b[256], msg_b2a[256];
+	struct pollfd pollfd[2];
+	u_int burst = 1024, wait_link = 4;
+	struct nmport_d *pa = NULL, *pb = NULL;
+	int pa_sw_rings, pb_sw_rings;
+	int __unused nqueues = 0, nifps = 0;
+
+	pa = nmport_open(ifa);
+	if (pa == NULL) {
+		D("cannot open %s", ifa);
+		exit(1);
+	}
+	/* try to reuse the mmap() of the first interface, if possible */
+	pb = nmport_open(ifb);
+	if (pb == NULL) {
+		D("cannot open %s", ifb);
+		nmport_close(pa);
+		exit(1);
+	}
+	zerocopy = zerocopy && (pa->mem == pb->mem);
+	D("------- zerocopy %ssupported", zerocopy ? "" : "NOT ");
+
+	/* setup poll(2) array */
+	memset(pollfd, 0, sizeof(pollfd));
+	pollfd[0].fd = pa->fd;
+	pollfd[1].fd = pb->fd;
+	struct ifpair ifps[] = {
+		{
+			.first = {
+				.nmport = pa,
+				.pfd = &pollfd[0],
+			},
+			.second = {
+				.nmport = pb,
+				.pfd = &pollfd[1],
+			},
+		},
+	};
+	nifps = 1;
+
+	D("Wait %d secs for link to come up...", wait_link);
+	/* sleep(wait_link); */
+	D("Ready to go, %s 0x%x/%d <-> %s 0x%x/%d.",
+		pa->hdr.nr_name, pa->first_rx_ring, pa->reg.nr_rx_rings,
+		pb->hdr.nr_name, pb->first_rx_ring, pb->reg.nr_rx_rings);
+
+	pa_sw_rings = (pa->reg.nr_mode == NR_REG_SW ||
+	    pa->reg.nr_mode == NR_REG_ONE_SW);
+	pb_sw_rings = (pb->reg.nr_mode == NR_REG_SW ||
+	    pb->reg.nr_mode == NR_REG_ONE_SW);
+
+	snprintf(msg_a2b, sizeof(msg_a2b), "%s:%s --> %s:%s",
+			pa->hdr.nr_name, pa_sw_rings ? "host" : "nic",
+			pb->hdr.nr_name, pb_sw_rings ? "host" : "nic");
+
+	snprintf(msg_b2a, sizeof(msg_b2a), "%s:%s --> %s:%s",
+			pb->hdr.nr_name, pb_sw_rings ? "host" : "nic",
+			pa->hdr.nr_name, pa_sw_rings ? "host" : "nic");
+
+	/* main loop */
+	signal(SIGINT, sigint_h);
+	while (!do_abort) {
+		int ret, i;
+
+		for (i = 0; i < nifps; i++)
+			prepare_poll(&ifps[i]);
+#ifdef BUSYWAIT
+		ret = 1;
+#else  /* !defined(BUSYWAIT) */
+		ret = poll(pollfd, 2, 2500);
+#endif /* !defined(BUSYWAIT) */
+		if (ret <= 0)
+		if (ret <= 0 || verbose)
+		    D("poll %s [0] ev %x %x rx %d@%d tx %d,"
+			     " [1] ev %x %x rx %d@%d tx %d",
+				ret <= 0 ? "timeout" : "ok",
+				pollfd[0].events,
+				pollfd[0].revents,
+				rx_slots_avail(pa),
+				NETMAP_RXRING(pa->nifp, pa->cur_rx_ring)->head,
+				tx_slots_avail(pa),
+				pollfd[1].events,
+				pollfd[1].revents,
+				rx_slots_avail(pb),
+				NETMAP_RXRING(pb->nifp, pb->cur_rx_ring)->head,
+				tx_slots_avail(pb)
+			);
+		if (ret < 0)
+			continue;
+		for (i = 0; i < nifps; i++)
+			do_poll(&ifps[i], burst, msg_a2b, msg_b2a);
+	}
+	nmport_close(pb);
+	nmport_close(pa);
+}
+
+static void consumer_proc(void *shdata)
+{
+}
+
 /*
  * Move up to 'limit' pkts from rxring to txring, swapping buffers
  * if zerocopy is possible. Otherwise fall back on packet copying.
@@ -433,18 +554,6 @@ usage(void)
 	exit(1);
 }
 
-struct poll_port {
-	struct nmport_d *nmport;
-	struct pollfd *pfd;
-};
-
-struct ifpair {
-	struct poll_port first;
-	struct poll_port second;
-	int first_index;
-	int second_index;
-};
-
 static void
 prepare_poll(struct ifpair *ifp)
 {
@@ -563,14 +672,9 @@ gotevent:
 int
 main(int argc, char **argv)
 {
-	/* struct ifpair ifps[1]; */
-	char msg_a2b[256], msg_b2a[256];
-	struct pollfd pollfd[2];
 	u_int burst = 1024, wait_link = 4;
-	struct nmport_d *pa = NULL, *pb = NULL;
 	char *ifa = NULL, *ifb = NULL;
 	char ifabuf[64] = { 0 };
-	int pa_sw_rings, pb_sw_rings;
 	int loopback = 0;
 	int ch;
 	int __unused nqueues = 0, nifps = 0;
@@ -650,93 +754,8 @@ main(int argc, char **argv)
 		/* two different interfaces. Take all rings on if1 */
 	}
 	shmem = mem_init(4);
-	pa = nmport_open(ifa);
-	if (pa == NULL) {
-		D("cannot open %s", ifa);
-		return (1);
-	}
-	/* try to reuse the mmap() of the first interface, if possible */
-	pb = nmport_open(ifb);
-	if (pb == NULL) {
-		D("cannot open %s", ifb);
-		nmport_close(pa);
-		return (1);
-	}
-	zerocopy = zerocopy && (pa->mem == pb->mem);
-	D("------- zerocopy %ssupported", zerocopy ? "" : "NOT ");
-
-	/* setup poll(2) array */
-	memset(pollfd, 0, sizeof(pollfd));
-	pollfd[0].fd = pa->fd;
-	pollfd[1].fd = pb->fd;
-	struct ifpair ifps[] = {
-		{
-			.first = {
-				.nmport = pa,
-				.pfd = &pollfd[0],
-			},
-			.second = {
-				.nmport = pb,
-				.pfd = &pollfd[1],
-			},
-		},
-	};
-	nifps = 1;
-
-	D("Wait %d secs for link to come up...", wait_link);
-	/* sleep(wait_link); */
-	D("Ready to go, %s 0x%x/%d <-> %s 0x%x/%d.",
-		pa->hdr.nr_name, pa->first_rx_ring, pa->reg.nr_rx_rings,
-		pb->hdr.nr_name, pb->first_rx_ring, pb->reg.nr_rx_rings);
-
-	pa_sw_rings = (pa->reg.nr_mode == NR_REG_SW ||
-	    pa->reg.nr_mode == NR_REG_ONE_SW);
-	pb_sw_rings = (pb->reg.nr_mode == NR_REG_SW ||
-	    pb->reg.nr_mode == NR_REG_ONE_SW);
-
-	snprintf(msg_a2b, sizeof(msg_a2b), "%s:%s --> %s:%s",
-			pa->hdr.nr_name, pa_sw_rings ? "host" : "nic",
-			pb->hdr.nr_name, pb_sw_rings ? "host" : "nic");
-
-	snprintf(msg_b2a, sizeof(msg_b2a), "%s:%s --> %s:%s",
-			pb->hdr.nr_name, pb_sw_rings ? "host" : "nic",
-			pa->hdr.nr_name, pa_sw_rings ? "host" : "nic");
-
-	/* main loop */
-	signal(SIGINT, sigint_h);
-	while (!do_abort) {
-		int ret, i;
-
-		for (i = 0; i < nifps; i++)
-			prepare_poll(&ifps[i]);
-#ifdef BUSYWAIT
-		ret = 1;
-#else  /* !defined(BUSYWAIT) */
-		ret = poll(pollfd, 2, 2500);
-#endif /* !defined(BUSYWAIT) */
-		if (ret <= 0)
-		if (ret <= 0 || verbose)
-		    D("poll %s [0] ev %x %x rx %d@%d tx %d,"
-			     " [1] ev %x %x rx %d@%d tx %d",
-				ret <= 0 ? "timeout" : "ok",
-				pollfd[0].events,
-				pollfd[0].revents,
-				rx_slots_avail(pa),
-				NETMAP_RXRING(pa->nifp, pa->cur_rx_ring)->head,
-				tx_slots_avail(pa),
-				pollfd[1].events,
-				pollfd[1].revents,
-				rx_slots_avail(pb),
-				NETMAP_RXRING(pb->nifp, pb->cur_rx_ring)->head,
-				tx_slots_avail(pb)
-			);
-		if (ret < 0)
-			continue;
-		for (i = 0; i < nifps; i++)
-			do_poll(&ifps[i], burst, msg_a2b, msg_b2a);
-	}
-	nmport_close(pb);
-	nmport_close(pa);
+	if (fork_or_die())
+		producer_proc(shmem, ifa, ifb);
 	mem_destroy(shmem, 4);
 
 	return (0);

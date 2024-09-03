@@ -41,9 +41,12 @@
 #define __unused __attribute__((__unused__))
 
 struct ifpair;
+struct pkt_ipc_ring;
 
 static void prepare_poll(struct ifpair *ifp);
-static void do_poll(struct ifpair *ifp, u_int burst, const char *msg_a2b,
+static void do_poll(struct ifpair *ifp, u_int burst,
+		    struct pkt_ipc_ring *ipr,
+		    const char *msg_a2b,
 		    const char *msg_b2a);
 
 struct poll_port {
@@ -291,6 +294,7 @@ static void child_proc(void *shdata)
 
 static void producer_proc(void *shdata, const char *ifa, const char *ifb)
 {
+	struct pkt_ipc_ring *ipr = shdata;
 	char msg_a2b[256], msg_b2a[256];
 	struct pollfd pollfd[2];
 	u_int burst = 1024, wait_link = 4;
@@ -381,7 +385,7 @@ static void producer_proc(void *shdata, const char *ifa, const char *ifb)
 		if (ret < 0)
 			continue;
 		for (i = 0; i < nifps; i++)
-			do_poll(&ifps[i], burst, msg_a2b, msg_b2a);
+			do_poll(&ifps[i], burst, ipr, msg_a2b, msg_b2a);
 	}
 	nmport_close(pb);
 	nmport_close(pa);
@@ -391,13 +395,55 @@ static void consumer_proc(void *shdata)
 {
 }
 
+static void print_pkt(char *rxbuf, const char *msg, uint16_t rx_ring,
+		      uint16_t tx_ring)
+{
+	struct ether_header *eh;
+	struct ip *ih = NULL;
+	struct netports *np = NULL;
+	char sbuf[INET_ADDRSTRLEN], dbuf[INET_ADDRSTRLEN];
+	int proto = 0;
+	uint8_t *sh, *dh;
+
+	eh = eth_hdr(rxbuf);
+	sh = eh->ether_shost;
+	dh = eh->ether_dhost;
+	switch (ntohs(eh->ether_type)) {
+	case ETHERTYPE_IP:
+		ih = ip_hdr(rxbuf + sizeof(*eh));
+		inet_ntop(AF_INET, &ih->ip_src, sbuf, sizeof(sbuf));
+		inet_ntop(AF_INET, &ih->ip_dst, dbuf, sizeof(dbuf));
+		switch (ih->ip_p) {
+		case IPPROTO_TCP:
+			proto++;
+			/* fallthrough */
+		case IPPROTO_UDP:
+			proto++;
+			np = to_netports(rxbuf + sizeof(*eh) + ip_hdrlen(ih));
+			break;
+		default:
+			return;
+		}
+		break;
+	default:
+		return;
+	}
+	printf("pkt: %s ring ( id %u -> %u ) %s%x:%x:%x:%x:%x:%x -> %x:%x:%x:%x:%x:%x"
+	       " %s:%u -> %s:%u\n",
+	       msg, rx_ring, tx_ring,
+	       proto == 1 ? "udp " : proto == 2 ? "tcp " : "n/a",
+	       sh[0], sh[1], sh[2], sh[3], sh[4], sh[5],
+	       dh[0], dh[1], dh[2], dh[3], dh[4], dh[5],
+	       sbuf, ntohs(np->sport), dbuf, ntohs(np->dport));
+}
+
 /*
  * Move up to 'limit' pkts from rxring to txring, swapping buffers
  * if zerocopy is possible. Otherwise fall back on packet copying.
  */
 static int
 rings_move(struct netmap_ring *rxring, struct netmap_ring *txring,
-	   u_int limit, const char *msg)
+	   struct pkt_ipc_ring *ipr, u_int limit, const char *msg)
 {
 	u_int j, k, m = 0;
 
@@ -434,54 +480,20 @@ rings_move(struct netmap_ring *rxring, struct netmap_ring *txring,
 		}
 		ts->len = rs->len;
 		if (zerocopy) {
-			struct ether_header *eh;
-			struct ip *ih = NULL;
-			struct netports *np = NULL;
-			char sbuf[INET_ADDRSTRLEN], dbuf[INET_ADDRSTRLEN];
-			int proto = 0;
-			/* struct tcp *th; */
 			char *rxbuf = NETMAP_BUF(rxring, rs->buf_idx);
-			uint8_t *sh, *dh;
 			uint32_t pkt = ts->buf_idx;
+
 			ts->buf_idx = rs->buf_idx;
 			rs->buf_idx = pkt;
 			/* report the buffer change. */
 			ts->flags |= NS_BUF_CHANGED;
 			rs->flags |= NS_BUF_CHANGED;
-			eh = eth_hdr(rxbuf);
-			sh = eh->ether_shost;
-			dh = eh->ether_dhost;
-			switch (ntohs(eh->ether_type)) {
-			case ETHERTYPE_IP:
-				ih = ip_hdr(rxbuf + sizeof(*eh));
-				inet_ntop(AF_INET, &ih->ip_src, sbuf, sizeof(sbuf));
-				inet_ntop(AF_INET, &ih->ip_dst, dbuf, sizeof(dbuf));
-				switch (ih->ip_p) {
-				case IPPROTO_TCP:
-					proto++;
-					/* fallthrough */
-				case IPPROTO_UDP:
-					proto++;
-					np = to_netports(rxbuf + sizeof(*eh) + ip_hdrlen(ih));
-					break;
-				default:
-					goto out;
-				}
-				break;
-			default:
-				goto out;
-			}
-			printf("pkt: %s ring ( id %u -> %u ) %s%x:%x:%x:%x:%x:%x -> %x:%x:%x:%x:%x:%x"
-			       " %s:%u -> %s:%u\n",
-			       msg, rxring->ringid, txring->ringid,
-			       proto == 1 ? "udp " : proto == 2 ? "tcp " : "n/a",
-			       sh[0], sh[1], sh[2], sh[3], sh[4], sh[5],
-			       dh[0], dh[1], dh[2], dh[3], dh[4], dh[5],
-			       sbuf, ntohs(np->sport), dbuf, ntohs(np->dport));
-out:;
+			print_pkt(rxbuf, msg, rxring->ringid, txring->ringid);
 		} else {
 			char *rxbuf = NETMAP_BUF(rxring, rs->buf_idx);
 			char *txbuf = NETMAP_BUF(txring, ts->buf_idx);
+
+			print_pkt(rxbuf, msg, rxring->ringid, txring->ringid);
 			nm_pkt_copy(rxbuf, txbuf, ts->len);
 		}
 		/*
@@ -505,7 +517,7 @@ out:;
 /* Move packets from source port to destination port. */
 static int
 ports_move(struct nmport_d *src, struct nmport_d *dst, u_int limit,
-	const char *msg)
+	   struct pkt_ipc_ring *ipr, const char *msg)
 {
 	struct netmap_ring *txring, *rxring;
 	u_int m = 0, si = src->first_rx_ring, di = dst->first_tx_ring;
@@ -522,7 +534,7 @@ ports_move(struct nmport_d *src, struct nmport_d *dst, u_int limit,
 			di++;
 			continue;
 		}
-		m += rings_move(rxring, txring, limit, msg);
+		m += rings_move(rxring, txring, ipr, limit, msg);
 	}
 	return (m);
 }
@@ -596,7 +608,9 @@ prepare_poll(struct ifpair *ifp)
 }
 
 static void
-do_poll(struct ifpair *ifp, u_int burst, const char *msg_a2b, const char *msg_b2a)
+do_poll(struct ifpair *ifp, u_int burst,
+	struct pkt_ipc_ring *ipr,
+	const char *msg_a2b, const char *msg_b2a)
 {
 	struct pollfd *pfa, *pfb;
 	struct nmport_d *pa, *pb;
@@ -619,14 +633,14 @@ do_poll(struct ifpair *ifp, u_int burst, const char *msg_a2b, const char *msg_b2
 		  rx->head, rx->cur, rx->tail);
 	}
 	if (pfa->revents & POLLOUT) {
-		ports_move(pb, pa, burst, msg_b2a);
+		ports_move(pb, pa, burst, ipr, msg_b2a);
 #ifdef BUSYWAIT
 		ioctl(pfa->fd, NIOCTXSYNC, NULL);
 #endif
 	}
 
 	if (pfb->revents & POLLOUT) {
-		ports_move(pa, pb, burst, msg_a2b);
+		ports_move(pa, pb, burst, ipr, msg_a2b);
 #ifdef BUSYWAIT
 		ioctl(pfb->fd, NIOCTXSYNC, NULL);
 #endif

@@ -37,7 +37,8 @@ install-%:
 	install -D $* $(DESTDIR)/$(PREFIX)/bin/$*
 	-install -D -m 644 $(SRCDIR)/apps/bridge/bridge.8 $(DESTDIR)/$(MAN_PREFIX)/man8/bridge.8
 
+bridge.o: ring.h
 bridge-b: bridge-b.o
 
-bridge-b.o: bridge.c
-	$(CC) $(CFLAGS) -DBUSYWAIT -c $^ -o $@
+bridge-b.o: bridge.c ring.h
+	$(CC) $(CFLAGS) -DBUSYWAIT -c $< -o $@

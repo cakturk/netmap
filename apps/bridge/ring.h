@@ -34,13 +34,14 @@
 #endif
 
 struct ring_pkt {
-	char data[1500];
+	unsigned int len;
+	char data[2040];
 };
 
 struct ring {
 	unsigned int r;
 	unsigned int w;
-	char buf[1024][2048];
+	struct ring_pkt pkts[1024];
 };
 
 static inline void ring_init(struct ring *r)
@@ -52,7 +53,7 @@ static inline void ring_init(struct ring *r)
 static inline unsigned long
 ring_mask(const struct ring *r, unsigned long val)
 {
-	return val & (nelem(r->buf) - 1);
+	return val & (nelem(r->pkts) - 1);
 }
 
 static inline unsigned long
@@ -64,13 +65,13 @@ ring_len(const struct ring *r)
 static inline unsigned long
 ring_unused(const struct ring *r)
 {
-	return nelem(r->buf) - (r->w - r->r);
+	return nelem(r->pkts) - (r->w - r->r);
 }
 
 static inline int
 ring_full(const struct ring *r)
 {
-	return ring_len(r) == nelem(r->buf);
+	return ring_len(r) == nelem(r->pkts);
 }
 
 static inline int
@@ -82,25 +83,35 @@ ring_empty(const struct ring *r)
 static inline int
 ring_put(struct ring *r, const void *p, unsigned int n)
 {
+	struct ring_pkt *pkt;
+
 	if (ring_full(r))
 		return 0;
 
-	memcpy(r->buf[ring_mask(r, r->w)], p, n);
+	pkt = &r->pkts[ring_mask(r, r->w)];
+	pkt->len = n;
+	memcpy(pkt->data, p, n);
 	wmb();
 	r->w++;
 	return 1;
 }
 
-static inline int
+static inline unsigned long
 ring_get(struct ring *r, void *p, unsigned int n)
 {
+	struct ring_pkt *pkt;
+
 	if (ring_empty(r))
 		return 0;
 
-	memcpy(p, r->buf[ring_mask(r, r->r)], n);
+	pkt = &r->pkts[ring_mask(r, r->r)];
+	if (pkt->len < n)
+		n = pkt->len;
+
+	memcpy(p, pkt->data, n);
 	wmb();
 	r->r++;
-	return 1;
+	return n;
 }
 
 #endif

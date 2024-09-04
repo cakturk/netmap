@@ -493,14 +493,11 @@ rings_move(struct netmap_ring *rxring, struct netmap_ring *txring,
 			rs->flags |= NS_BUF_CHANGED;
 			print_pkt(rxbuf, msg, rxring->ringid, txring->ringid);
 		} else {
-			struct ring *r = &ipr->pi_rx.p_ring;
-			char *rxbuf = NETMAP_BUF(rxring, rs->buf_idx);
 			char *txbuf = NETMAP_BUF(txring, ts->buf_idx);
-			char p[1514];
+			char *rxbuf = NETMAP_BUF(rxring, rs->buf_idx);
+			struct ring *r = &ipr->pi_rx.p_ring;
 
 			ring_put(r, rxbuf, ts->len);
-			/* ring_get(r, p, ts->len); */
-			/* memcpy(p, rxbuf, ts->len); */
 			ring_get(r, txbuf, ts->len);
 			print_pkt(rxbuf, msg, rxring->ringid, txring->ringid);
 			/* nm_pkt_copy(p, txbuf, ts->len); */
@@ -779,6 +776,8 @@ main(int argc, char **argv)
 	shmem = mem_init(4);
 	if (fork_or_die())
 		producer_proc(shmem, ifa, ifb);
+	else
+		consumer_proc(shmem);
 	mem_destroy(shmem, 4);
 
 	return (0);

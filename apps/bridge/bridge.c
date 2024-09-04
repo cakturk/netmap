@@ -391,10 +391,6 @@ static void producer_proc(void *shdata, const char *ifa, const char *ifb)
 	nmport_close(pa);
 }
 
-static void consumer_proc(void *shdata)
-{
-}
-
 static void print_pkt(char *rxbuf, const char *msg, uint16_t rx_ring,
 		      uint16_t tx_ring)
 {
@@ -438,6 +434,34 @@ static void print_pkt(char *rxbuf, const char *msg, uint16_t rx_ring,
 	       sh[0], sh[1], sh[2], sh[3], sh[4], sh[5],
 	       dh[0], dh[1], dh[2], dh[3], dh[4], dh[5],
 	       sbuf, ntohs(np->sport), dbuf, ntohs(np->dport));
+}
+
+static void consumer_proc(void *shdata)
+{
+	struct pkt_ipc_ring *ipr = shdata;
+	struct ring *r = &ipr->pi_rx.p_ring;
+	struct ring *x = &ipr->pi_tx.p_ring;
+
+	for (;;) {
+		unsigned long len;
+		char p[2048];
+
+
+		pthread_mutex_lock(&ipr->pi_rx.p_mtx);
+		while (ring_len(&ipr->pi_rx.p_ring) <= 0) {
+			printf("%s: sleeping\n", __func__);
+			pthread_cond_wait(&ipr->pi_rx.p_wake, &ipr->pi_rx.p_mtx);
+			printf("%s: woken up\n", __func__);
+		}
+		pthread_mutex_unlock(&ipr->pi_rx.p_mtx);
+
+		len = ring_get(r, p, sizeof(p));
+		printf("%s: ring get %lu\n", __func__, len);
+		if (!len)
+			continue;
+		ring_put(x, p, len);
+		print_pkt(p, "consumer", 0, 0);
+	}
 }
 
 /*
@@ -496,10 +520,14 @@ rings_move(struct netmap_ring *rxring, struct netmap_ring *txring,
 			char *txbuf = NETMAP_BUF(txring, ts->buf_idx);
 			char *rxbuf = NETMAP_BUF(rxring, rs->buf_idx);
 			struct ring *r = &ipr->pi_rx.p_ring;
+			struct ring *x = &ipr->pi_tx.p_ring;
+			unsigned long len = 33;
 
 			ring_put(r, rxbuf, ts->len);
-			ring_get(r, txbuf, ts->len);
+			len = ring_get(x, txbuf, ts->len);
+			printf("tx ring get len %lu %lu\n", len, ring_len(x));
 			print_pkt(rxbuf, msg, rxring->ringid, txring->ringid);
+			pkt_ring_wake(&ipr->pi_rx);
 			/* nm_pkt_copy(p, txbuf, ts->len); */
 		}
 		/*
@@ -508,10 +536,12 @@ rings_move(struct netmap_ring *rxring, struct netmap_ring *txring,
 		 */
 		ts->flags = (ts->flags & ~NS_MOREFRAG) | (rs->flags & NS_MOREFRAG);
 		j = nm_ring_next(rxring, j);
-		k = nm_ring_next(txring, k);
+		if (zerocopy)
+			k = nm_ring_next(txring, k);
 	}
 	rxring->head = rxring->cur = j;
-	txring->head = txring->cur = k;
+	if (zerocopy)
+		txring->head = txring->cur = k;
 	if (0)
 	if (verbose && m > 0)
 		D("%s fwd %d packets: rxring %u --> txring %u",

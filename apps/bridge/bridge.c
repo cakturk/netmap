@@ -192,9 +192,11 @@ typedef struct {
 } shared_data_t;
 
 struct pkt_ring {
+	char p_name[16];
 	pthread_mutex_t p_mtx;
 	pthread_cond_t p_wake;
 	struct ring p_ring;
+	struct netmap_ring *p_nmring;
 };
 
 struct pkt_ipc_ring {
@@ -203,10 +205,13 @@ struct pkt_ipc_ring {
 };
 
 static void
-pkt_ring_init(struct pkt_ring *pr, void *buf, size_t size, size_t nmemb)
+pkt_ring_init(struct pkt_ring *pr, int isrx, int ringnum)
 {
 	pthread_mutexattr_t mutex_attr;
 	pthread_condattr_t cond_attr;
+
+	snprintf(pr->p_name, sizeof(pr->p_name), "%s nmr %u",
+		 isrx ? "rx" : "tx", ringnum);
 
 	pthread_mutexattr_init(&mutex_attr);
 	pthread_mutexattr_setpshared(&mutex_attr, PTHREAD_PROCESS_SHARED);
@@ -226,6 +231,18 @@ pkt_ring_wake(struct pkt_ring *pr)
 	pthread_cond_signal(&pr->p_wake);
 }
 
+static void
+pkt_ring_wait(struct pkt_ring *pr)
+{
+	pthread_mutex_lock(&pr->p_mtx);
+	while (ring_len(&pr->p_ring) <= 0) {
+		printf("%s: sleeping\n", __func__);
+		pthread_cond_wait(&pr->p_wake, &pr->p_mtx);
+		printf("%s: woken up\n", __func__);
+	}
+	pthread_mutex_unlock(&pr->p_mtx);
+}
+
 static void *
 mem_init(int nconsumer)
 {
@@ -242,8 +259,8 @@ mem_init(int nconsumer)
 		die("%s: failed to mmap shared mem\n", __func__);
 	close(fd);
 
-	pkt_ring_init(&ipr->pi_tx, NULL, 0, 0);
-	pkt_ring_init(&ipr->pi_rx, NULL, 0, 0);
+	pkt_ring_init(&ipr->pi_tx, 0, 0);
+	pkt_ring_init(&ipr->pi_rx, 1, 1);
 
 	return ipr;
 }
@@ -300,7 +317,7 @@ static void producer_proc(void *shdata, const char *ifa, const char *ifb)
 	u_int burst = 1024, wait_link = 4;
 	struct nmport_d *pa = NULL, *pb = NULL;
 	int pa_sw_rings, pb_sw_rings;
-	int __unused nqueues = 0, nifps = 0;
+	int nifps = 0;
 
 	pa = nmport_open(ifa);
 	if (pa == NULL) {
@@ -436,6 +453,14 @@ static void print_pkt(char *rxbuf, const char *msg, uint16_t rx_ring,
 	       sbuf, ntohs(np->sport), dbuf, ntohs(np->dport));
 }
 
+static void *producer_receive(void *shdata)
+{
+	struct pkt_ipc_ring *ipr = shdata;
+
+	printf("producer receive\n");
+	return NULL;
+}
+
 static void consumer_proc(void *shdata)
 {
 	struct pkt_ipc_ring *ipr = shdata;
@@ -524,10 +549,10 @@ rings_move(struct netmap_ring *rxring, struct netmap_ring *txring,
 			unsigned long len = 33;
 
 			ring_put(r, rxbuf, ts->len);
-			len = ring_get(x, txbuf, ts->len);
-			printf("tx ring get len %lu %lu\n", len, ring_len(x));
+			len = ring_get(r, txbuf, ts->len);
+			/* printf("tx ring get len %lu %lu\n", len, ring_len(x)); */
 			print_pkt(rxbuf, msg, rxring->ringid, txring->ringid);
-			pkt_ring_wake(&ipr->pi_rx);
+			/* pkt_ring_wake(&ipr->pi_rx); */
 			/* nm_pkt_copy(p, txbuf, ts->len); */
 		}
 		/*
@@ -536,12 +561,10 @@ rings_move(struct netmap_ring *rxring, struct netmap_ring *txring,
 		 */
 		ts->flags = (ts->flags & ~NS_MOREFRAG) | (rs->flags & NS_MOREFRAG);
 		j = nm_ring_next(rxring, j);
-		if (zerocopy)
-			k = nm_ring_next(txring, k);
+		k = nm_ring_next(txring, k);
 	}
 	rxring->head = rxring->cur = j;
-	if (zerocopy)
-		txring->head = txring->cur = k;
+	txring->head = txring->cur = k;
 	if (0)
 	if (verbose && m > 0)
 		D("%s fwd %d packets: rxring %u --> txring %u",
@@ -558,7 +581,6 @@ ports_move(struct nmport_d *src, struct nmport_d *dst, u_int limit,
 	struct netmap_ring *txring, *rxring;
 	u_int m = 0, si = src->first_rx_ring, di = dst->first_tx_ring;
 
-	/* printf("first rx %u tx %u\n", si, di); */
 	while (si <= src->last_rx_ring && di <= dst->last_tx_ring) {
 		rxring = NETMAP_RXRING(src->nifp, si);
 		txring = NETMAP_TXRING(dst->nifp, di);
@@ -726,9 +748,10 @@ main(int argc, char **argv)
 	char *ifa = NULL, *ifb = NULL;
 	char ifabuf[64] = { 0 };
 	int loopback = 0;
-	int ch;
-	int __unused nqueues = 0, nifps = 0;
+	int ch, ret;
+	int __unused nqueues = 0;
 	void *shmem;
+	pthread_t th;
 
 	while ((ch = getopt(argc, argv, "hb:ci:q:vw:L")) != -1) {
 		switch (ch) {
@@ -804,10 +827,15 @@ main(int argc, char **argv)
 		/* two different interfaces. Take all rings on if1 */
 	}
 	shmem = mem_init(4);
-	if (fork_or_die())
+	if (fork_or_die()) {
+		ret = pthread_create(&th, NULL, producer_receive, shmem);
+		if (ret)
+			die("failed to create thread\n");
 		producer_proc(shmem, ifa, ifb);
-	else
+	} else {
 		consumer_proc(shmem);
+	}
+	pthread_join(th, NULL);
 	mem_destroy(shmem, 4);
 
 	return (0);

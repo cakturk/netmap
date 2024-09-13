@@ -249,12 +249,13 @@ pkt_ring_wake(struct pkt_ring *pr)
 static void
 pkt_ring_wait(struct pkt_ring *pr)
 {
+	printf("%s(%s): before sleeping\n", __func__, pr->p_name);
 	pthread_mutex_lock(&pr->p_mtx);
 	while (ring_len(&pr->p_ring) <= 0) {
 
-		printf("%s: sleeping\n", __func__);
+		printf("%s(%s): sleeping\n", __func__, pr->p_name);
 		pthread_cond_wait(&pr->p_wake, &pr->p_mtx);
-		printf("%s: woken up\n", __func__);
+		printf("%s(%s): woken up\n", __func__, pr->p_name);
 	}
 	pthread_mutex_unlock(&pr->p_mtx);
 }
@@ -507,12 +508,40 @@ static void print_pkt(char *rxbuf, const char *msg, uint16_t rx_ring,
 	       sbuf, ntohs(np->sport), dbuf, ntohs(np->dport));
 }
 
-static void *producer_receive(void *shdata)
+static void *producer_receive_soft(void *shdata)
 {
 	struct pkt_port *ipr = shdata;
 
-	printf("producer receive\n");
+	printf("producer receive sw\n");
 	return NULL;
+}
+
+static void *producer_receive_hard(void *shdata)
+{
+	struct pkt_port *ipr = shdata;
+
+	printf("producer receive hw\n");
+	return NULL;
+}
+
+static void *consumer_proc_rxhw(void *shdata)
+{
+	struct shm_struct *shm = shdata;
+	struct pkt_port *pa = &shm->s_pa;
+
+	for (;;) {
+		pkt_ring_wait(&pa->pi_rx);
+	}
+}
+
+static void *consumer_proc_rxsw(void *shdata)
+{
+	struct shm_struct *shm = shdata;
+	struct pkt_port *pb = &shm->s_pb;
+
+	for (;;) {
+		pkt_ring_wait(&pb->pi_rx);
+	}
 }
 
 static void consumer_proc(void *shdata)
@@ -520,7 +549,24 @@ static void consumer_proc(void *shdata)
 	struct pkt_port *ipr = shdata;
 	struct ring *r = &ipr->pi_rx.p_ring;
 	struct ring *x = &ipr->pi_tx.p_ring;
+	pthread_t thhw, thsw;
+	int ret;
 
+	printf("consumer proc inited\n");
+	ret = pthread_create(&thhw, NULL, consumer_proc_rxhw, shdata);
+	if (ret)
+		die("consumer: failed to create hw rx\n");
+
+	ret = pthread_create(&thsw, NULL, consumer_proc_rxsw, shdata);
+	if (ret)
+		die("consumer: failed to create sw rx\n");
+
+
+	printf("cosumer joining\n");
+	pthread_join(thhw, NULL);
+	pthread_join(thsw, NULL);
+	printf("cosumer joining finished\n");
+	return;
 	for (;;) {
 		unsigned long len;
 		char p[2048];
@@ -605,13 +651,12 @@ rings_move(struct netmap_ring *rxring, struct netmap_ring *txring,
 
 			rxp = rxport(shm, rxring);
 			txp = txport(shm, txring);
-			printf("rxp %p txp %p shm %p -> %p nm %p -> %p\n", rxp, txp,
-			       rxp->pi_rx.p_nmring, txp->pi_tx.p_nmring, rxring, txring);
+			r = &rxp->pi_rx.p_ring;
+			x = &txp->pi_tx.p_ring;
 			ring_put(r, rxbuf, ts->len);
 			len = ring_get(r, txbuf, ts->len);
-			/* printf("tx ring get len %lu %lu\n", len, ring_len(x)); */
 			print_pkt(rxbuf, msg, rxring->ringid, txring->ringid);
-			/* pkt_ring_wake(&ipr->pi_rx); */
+			pkt_ring_wake(&rxp->pi_rx);
 			/* nm_pkt_copy(p, txbuf, ts->len); */
 		}
 		/*
@@ -886,13 +931,14 @@ main(int argc, char **argv)
 		/* two different interfaces. Take all rings on if1 */
 	}
 	shmem = mem_init(4);
-	ret = pthread_create(&th, NULL, producer_receive, shmem);
-	if (ret)
-		die("failed to create thread\n");
-	producer_proc(shmem, ifa, ifb);
-
-	if (fork_or_die() == 0)
+	if (fork_or_die()) {
+		producer_proc(shmem, ifa, ifb);
+		ret = pthread_create(&th, NULL, producer_receive_soft, shmem);
+		if (ret)
+			die("failed to create thread\n");
+	} else {
 		consumer_proc(shmem);
+	}
 	pthread_join(th, NULL);
 	mem_destroy(shmem, 4);
 

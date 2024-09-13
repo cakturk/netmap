@@ -41,11 +41,11 @@
 #define __unused __attribute__((__unused__))
 
 struct ifpair;
-struct pkt_ipc_ring;
+struct pkt_port;
 
 static void prepare_poll(struct ifpair *ifp);
 static void do_poll(struct ifpair *ifp, u_int burst,
-		    struct pkt_ipc_ring *ipr,
+		    struct pkt_port *ipr,
 		    const char *msg_a2b,
 		    const char *msg_b2a);
 
@@ -199,7 +199,13 @@ struct pkt_ring {
 	struct netmap_ring *p_nmring;
 };
 
-struct pkt_ipc_ring {
+/*
+ * The pkt_port type represents the hardware and software ring pair in
+ * netmap jargon. For example, the hardware pkt_port structure holds the
+ * data required for packets coming from (rx) and going to (tx) the
+ * network adapter.
+ */
+struct pkt_port {
 	struct pkt_ring pi_tx;
 	struct pkt_ring pi_rx;
 };
@@ -246,14 +252,14 @@ pkt_ring_wait(struct pkt_ring *pr)
 static void *
 mem_init(int nconsumer)
 {
-	struct pkt_ipc_ring *ipr;
+	struct pkt_port *ipr;
 	int fd;
 
 	if ((fd = shm_open("/pkt_memory", O_CREAT | O_RDWR, 0666)) < 0)
 		die("failed to shm_open\n");
-	if (ftruncate(fd, sizeof(struct pkt_ipc_ring) * nconsumer) != 0)
+	if (ftruncate(fd, sizeof(struct pkt_port) * nconsumer) != 0)
 		die("failed to ftruncate\n");
-	ipr = mmap(NULL, sizeof(struct pkt_ipc_ring) * nconsumer,
+	ipr = mmap(NULL, sizeof(struct pkt_port) * nconsumer,
 		      PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 	if (ipr == MAP_FAILED)
 		die("%s: failed to mmap shared mem\n", __func__);
@@ -281,7 +287,7 @@ static void parent_proc(void *shdata)
 {
 	char buf[1500];
 	int got;
-	struct pkt_ipc_ring *ipr = shdata;
+	struct pkt_port *ipr = shdata;
 	struct ring *r = &ipr->pi_rx.p_ring;
 
 	printf("parent running %d\n", getpid());
@@ -298,7 +304,7 @@ static void parent_proc(void *shdata)
 
 static void child_proc(void *shdata)
 {
-	struct pkt_ipc_ring *ipr = shdata;
+	struct pkt_port *ipr = shdata;
 	struct ring *r = &ipr->pi_rx.p_ring;
 
 	ring_put(r, "this is message", 16);
@@ -311,7 +317,7 @@ static void child_proc(void *shdata)
 
 static void producer_proc(void *shdata, const char *ifa, const char *ifb)
 {
-	struct pkt_ipc_ring *ipr = shdata;
+	struct pkt_port *ipr = shdata;
 	char msg_a2b[256], msg_b2a[256];
 	struct pollfd pollfd[2];
 	u_int burst = 1024, wait_link = 4;
@@ -455,7 +461,7 @@ static void print_pkt(char *rxbuf, const char *msg, uint16_t rx_ring,
 
 static void *producer_receive(void *shdata)
 {
-	struct pkt_ipc_ring *ipr = shdata;
+	struct pkt_port *ipr = shdata;
 
 	printf("producer receive\n");
 	return NULL;
@@ -463,7 +469,7 @@ static void *producer_receive(void *shdata)
 
 static void consumer_proc(void *shdata)
 {
-	struct pkt_ipc_ring *ipr = shdata;
+	struct pkt_port *ipr = shdata;
 	struct ring *r = &ipr->pi_rx.p_ring;
 	struct ring *x = &ipr->pi_tx.p_ring;
 
@@ -495,7 +501,7 @@ static void consumer_proc(void *shdata)
  */
 static int
 rings_move(struct netmap_ring *rxring, struct netmap_ring *txring,
-	   struct pkt_ipc_ring *ipr, u_int limit, const char *msg)
+	   struct pkt_port *ipr, u_int limit, const char *msg)
 {
 	u_int j, k, m = 0;
 
@@ -576,7 +582,7 @@ rings_move(struct netmap_ring *rxring, struct netmap_ring *txring,
 /* Move packets from source port to destination port. */
 static int
 ports_move(struct nmport_d *src, struct nmport_d *dst, u_int limit,
-	   struct pkt_ipc_ring *ipr, const char *msg)
+	   struct pkt_port *ipr, const char *msg)
 {
 	struct netmap_ring *txring, *rxring;
 	u_int m = 0, si = src->first_rx_ring, di = dst->first_tx_ring;
@@ -667,7 +673,7 @@ prepare_poll(struct ifpair *ifp)
 
 static void
 do_poll(struct ifpair *ifp, u_int burst,
-	struct pkt_ipc_ring *ipr,
+	struct pkt_port *ipr,
 	const char *msg_a2b, const char *msg_b2a)
 {
 	struct pollfd *pfa, *pfb;

@@ -327,8 +327,10 @@ static void child_proc(void *shdata)
 
 static void pkt_port_init(struct pkt_port *p, struct nmport_d *nmp)
 {
-	p->pi_tx.p_nmring = NETMAP_RXRING(nmp->nifp, nmp->first_rx_ring);
-	p->pi_rx.p_nmring = NETMAP_RXRING(nmp->nifp, nmp->first_tx_ring);
+	p->pi_tx.p_nmring = NETMAP_TXRING(nmp->nifp, nmp->first_tx_ring);
+	p->pi_rx.p_nmring = NETMAP_RXRING(nmp->nifp, nmp->first_rx_ring);
+
+	printf("init rx %p tx %p\n", p->pi_rx.p_nmring, p->pi_tx.p_nmring);
 }
 
 static void producer_proc(void *shdata, const char *ifa, const char *ifb)
@@ -574,6 +576,9 @@ rings_move(struct netmap_ring *rxring, struct netmap_ring *txring,
 			struct ring *x = &shm->s_pa.pi_tx.p_ring;
 			unsigned long len = 33;
 
+			printf("nm %p %p shm pa %p %p pb %p %p\n", rxring, txring,
+			       shm->s_pa.pi_rx.p_nmring, shm->s_pa.pi_tx.p_nmring,
+			       shm->s_pb.pi_rx.p_nmring, shm->s_pb.pi_tx.p_nmring);
 			ring_put(r, rxbuf, ts->len);
 			len = ring_get(r, txbuf, ts->len);
 			/* printf("tx ring get len %lu %lu\n", len, ring_len(x)); */

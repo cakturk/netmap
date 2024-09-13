@@ -42,10 +42,11 @@
 
 struct ifpair;
 struct pkt_port;
+struct shm_struct;
 
 static void prepare_poll(struct ifpair *ifp);
 static void do_poll(struct ifpair *ifp, u_int burst,
-		    struct pkt_port *ipr,
+		    struct shm_struct *shm,
 		    const char *msg_a2b,
 		    const char *msg_b2a);
 
@@ -200,7 +201,7 @@ struct pkt_ring {
 };
 
 /*
- * The pkt_port type represents the hardware and software ring pair in
+ * pkt_port type represents the hardware and software ring pair in
  * netmap jargon. For example, the hardware pkt_port structure holds the
  * data required for packets coming from (rx) and going to (tx) the
  * network adapter.
@@ -208,6 +209,14 @@ struct pkt_ring {
 struct pkt_port {
 	struct pkt_ring pi_tx;
 	struct pkt_ring pi_rx;
+};
+
+/*
+ * shm_struct type represents netmap hardware and software interfaces.
+ */
+struct shm_struct {
+	struct pkt_port s_pa;
+	struct pkt_port s_pb;
 };
 
 static void
@@ -242,6 +251,7 @@ pkt_ring_wait(struct pkt_ring *pr)
 {
 	pthread_mutex_lock(&pr->p_mtx);
 	while (ring_len(&pr->p_ring) <= 0) {
+
 		printf("%s: sleeping\n", __func__);
 		pthread_cond_wait(&pr->p_wake, &pr->p_mtx);
 		printf("%s: woken up\n", __func__);
@@ -252,23 +262,23 @@ pkt_ring_wait(struct pkt_ring *pr)
 static void *
 mem_init(int nconsumer)
 {
-	struct pkt_port *ipr;
+	struct shm_struct *shm;
 	int fd;
 
 	if ((fd = shm_open("/pkt_memory", O_CREAT | O_RDWR, 0666)) < 0)
 		die("failed to shm_open\n");
-	if (ftruncate(fd, sizeof(struct pkt_port) * nconsumer) != 0)
+	if (ftruncate(fd, sizeof(*shm) * nconsumer) != 0)
 		die("failed to ftruncate\n");
-	ipr = mmap(NULL, sizeof(struct pkt_port) * nconsumer,
+	shm = mmap(NULL, sizeof(*shm) * nconsumer,
 		      PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-	if (ipr == MAP_FAILED)
+	if (shm == MAP_FAILED)
 		die("%s: failed to mmap shared mem\n", __func__);
 	close(fd);
 
-	pkt_ring_init(&ipr->pi_tx, 0, 0);
-	pkt_ring_init(&ipr->pi_rx, 1, 1);
+	pkt_ring_init(&shm->s_pa.pi_tx, 0, 0);
+	pkt_ring_init(&shm->s_pb.pi_rx, 1, 1);
 
-	return ipr;
+	return shm;
 }
 
 static void
@@ -315,9 +325,15 @@ static void child_proc(void *shdata)
 	pthread_mutex_unlock(&ipr->pi_rx.p_mtx);
 }
 
+static void pkt_port_init(struct pkt_port *p, struct nmport_d *nmp)
+{
+	p->pi_tx.p_nmring = NETMAP_RXRING(nmp->nifp, nmp->first_rx_ring);
+	p->pi_rx.p_nmring = NETMAP_RXRING(nmp->nifp, nmp->first_tx_ring);
+}
+
 static void producer_proc(void *shdata, const char *ifa, const char *ifb)
 {
-	struct pkt_port *ipr = shdata;
+	struct shm_struct *shm = shdata;
 	char msg_a2b[256], msg_b2a[256];
 	struct pollfd pollfd[2];
 	u_int burst = 1024, wait_link = 4;
@@ -337,6 +353,10 @@ static void producer_proc(void *shdata, const char *ifa, const char *ifb)
 		nmport_close(pa);
 		exit(1);
 	}
+
+	pkt_port_init(&shm->s_pa, pa);
+	pkt_port_init(&shm->s_pb, pb);
+
 	zerocopy = zerocopy && (pa->mem == pb->mem);
 	D("------- zerocopy %ssupported", zerocopy ? "" : "NOT ");
 
@@ -408,7 +428,7 @@ static void producer_proc(void *shdata, const char *ifa, const char *ifb)
 		if (ret < 0)
 			continue;
 		for (i = 0; i < nifps; i++)
-			do_poll(&ifps[i], burst, ipr, msg_a2b, msg_b2a);
+			do_poll(&ifps[i], burst, shm, msg_a2b, msg_b2a);
 	}
 	nmport_close(pb);
 	nmport_close(pa);
@@ -501,7 +521,7 @@ static void consumer_proc(void *shdata)
  */
 static int
 rings_move(struct netmap_ring *rxring, struct netmap_ring *txring,
-	   struct pkt_port *ipr, u_int limit, const char *msg)
+	   struct shm_struct *shm, u_int limit, const char *msg)
 {
 	u_int j, k, m = 0;
 
@@ -550,8 +570,8 @@ rings_move(struct netmap_ring *rxring, struct netmap_ring *txring,
 		} else {
 			char *txbuf = NETMAP_BUF(txring, ts->buf_idx);
 			char *rxbuf = NETMAP_BUF(rxring, rs->buf_idx);
-			struct ring *r = &ipr->pi_rx.p_ring;
-			struct ring *x = &ipr->pi_tx.p_ring;
+			struct ring *r = &shm->s_pa.pi_rx.p_ring;
+			struct ring *x = &shm->s_pa.pi_tx.p_ring;
 			unsigned long len = 33;
 
 			ring_put(r, rxbuf, ts->len);
@@ -582,7 +602,7 @@ rings_move(struct netmap_ring *rxring, struct netmap_ring *txring,
 /* Move packets from source port to destination port. */
 static int
 ports_move(struct nmport_d *src, struct nmport_d *dst, u_int limit,
-	   struct pkt_port *ipr, const char *msg)
+	   struct shm_struct *shm, const char *msg)
 {
 	struct netmap_ring *txring, *rxring;
 	u_int m = 0, si = src->first_rx_ring, di = dst->first_tx_ring;
@@ -598,7 +618,7 @@ ports_move(struct nmport_d *src, struct nmport_d *dst, u_int limit,
 			di++;
 			continue;
 		}
-		m += rings_move(rxring, txring, ipr, limit, msg);
+		m += rings_move(rxring, txring, shm, limit, msg);
 	}
 	return (m);
 }
@@ -673,7 +693,7 @@ prepare_poll(struct ifpair *ifp)
 
 static void
 do_poll(struct ifpair *ifp, u_int burst,
-	struct pkt_port *ipr,
+	struct shm_struct *shm,
 	const char *msg_a2b, const char *msg_b2a)
 {
 	struct pollfd *pfa, *pfb;
@@ -697,14 +717,14 @@ do_poll(struct ifpair *ifp, u_int burst,
 		  rx->head, rx->cur, rx->tail);
 	}
 	if (pfa->revents & POLLOUT) {
-		ports_move(pb, pa, burst, ipr, msg_b2a);
+		ports_move(pb, pa, burst, shm, msg_b2a);
 #ifdef BUSYWAIT
 		ioctl(pfa->fd, NIOCTXSYNC, NULL);
 #endif
 	}
 
 	if (pfb->revents & POLLOUT) {
-		ports_move(pa, pb, burst, ipr, msg_a2b);
+		ports_move(pa, pb, burst, shm, msg_a2b);
 #ifdef BUSYWAIT
 		ioctl(pfb->fd, NIOCTXSYNC, NULL);
 #endif
@@ -833,14 +853,13 @@ main(int argc, char **argv)
 		/* two different interfaces. Take all rings on if1 */
 	}
 	shmem = mem_init(4);
-	if (fork_or_die()) {
-		ret = pthread_create(&th, NULL, producer_receive, shmem);
-		if (ret)
-			die("failed to create thread\n");
-		producer_proc(shmem, ifa, ifb);
-	} else {
+	ret = pthread_create(&th, NULL, producer_receive, shmem);
+	if (ret)
+		die("failed to create thread\n");
+	producer_proc(shmem, ifa, ifb);
+
+	if (fork_or_die() == 0)
 		consumer_proc(shmem);
-	}
 	pthread_join(th, NULL);
 	mem_destroy(shmem, 4);
 

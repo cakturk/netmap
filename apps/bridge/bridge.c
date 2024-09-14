@@ -592,7 +592,6 @@ static void consumer_proc(void *shdata)
 	pthread_t thhw, thsw;
 	int ret;
 
-	printf("consumer proc inited\n");
 	ret = pthread_create(&thhw, NULL, consumer_proc_rxhw, shdata);
 	if (ret)
 		die("consumer: failed to create hw rx\n");
@@ -602,31 +601,9 @@ static void consumer_proc(void *shdata)
 		die("consumer: failed to create sw rx\n");
 
 
-	printf("cosumer joining\n");
 	pthread_join(thhw, NULL);
 	pthread_join(thsw, NULL);
-	printf("cosumer joining finished\n");
 	return;
-	for (;;) {
-		unsigned long len;
-		char p[2048];
-
-
-		pthread_mutex_lock(&ipr->pi_rx.p_mtx);
-		while (ring_len(&ipr->pi_rx.p_ring) <= 0) {
-			printf("%s: sleeping\n", __func__);
-			pthread_cond_wait(&ipr->pi_rx.p_wake, &ipr->pi_rx.p_mtx);
-			printf("%s: woken up\n", __func__);
-		}
-		pthread_mutex_unlock(&ipr->pi_rx.p_mtx);
-
-		len = ring_get(r, p, sizeof(p));
-		printf("%s: ring get %lu\n", __func__, len);
-		if (!len)
-			continue;
-		ring_put(x, p, len);
-		print_pkt(p, "consumer", 0, 0);
-	}
 }
 
 /*

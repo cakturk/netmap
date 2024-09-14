@@ -40,6 +40,26 @@
 
 #define __unused __attribute__((__unused__))
 
+#define wait_event(expr, m, cond) do {		\
+	if (expr)				\
+		break;				\
+	pthread_mutex_lock((m));		\
+	while (!(expr))				\
+		pthread_cond_wait((cond), (m));	\
+	pthread_mutex_unlock((m));		\
+} while (0)
+
+#define __set_event(expr, m, cond, sigfn) do {	\
+	pthread_mutex_lock((m));		\
+	expr;					\
+	sigfn((cond));				\
+	pthread_mutex_unlock((m));		\
+} while (0)
+
+#define set_event(expr, m, cond) __set_event(expr, m, cond, pthread_cond_signal)
+#define set_event_broadcast(expr, m, cond)	\
+	__set_event(expr, m, cond, pthread_cond_broadcast)
+
 struct ifpair;
 struct pkt_port;
 struct shm_struct;
@@ -215,6 +235,12 @@ struct pkt_port {
  * shm_struct type represents netmap hardware and software interfaces.
  */
 struct shm_struct {
+	struct ready_notifier {
+		pthread_mutex_t rn_ready_mtx;
+		pthread_cond_t rn_ready_cond;
+		int rn_ready;
+	} s_notifier;
+
 	struct pkt_port s_pa;
 	struct pkt_port s_pb;
 };
@@ -265,7 +291,10 @@ static void pkt_port_init(struct pkt_port *p, struct nmport_d *nmp)
 	p->pi_rx.p_nmring = NETMAP_RXRING(nmp->nifp, nmp->first_rx_ring);
 	p->pi_tx.p_nmring = NETMAP_TXRING(nmp->nifp, nmp->first_tx_ring);
 
-	printf("init rx %p tx %p\n", p->pi_rx.p_nmring, p->pi_tx.p_nmring);
+	pkt_ring_init(&p->pi_rx, 1, nmp->first_rx_ring);
+	pkt_ring_init(&p->pi_tx, 0, nmp->first_tx_ring);
+
+	printf("%s init rx %p tx %p\n", nmp->hdr.nr_name, p->pi_rx.p_nmring, p->pi_tx.p_nmring);
 }
 
 static struct pkt_port *rxport(struct shm_struct *shm,
@@ -297,6 +326,8 @@ static struct pkt_port *txport(struct shm_struct *shm,
 static void *
 mem_init(int nconsumer)
 {
+	pthread_mutexattr_t mutex_attr;
+	pthread_condattr_t cond_attr;
 	struct shm_struct *shm;
 	int fd;
 
@@ -310,8 +341,14 @@ mem_init(int nconsumer)
 		die("%s: failed to mmap shared mem\n", __func__);
 	close(fd);
 
-	pkt_ring_init(&shm->s_pa.pi_tx, 0, 0);
-	pkt_ring_init(&shm->s_pb.pi_rx, 1, 1);
+	pthread_mutexattr_init(&mutex_attr);
+	pthread_mutexattr_setpshared(&mutex_attr, PTHREAD_PROCESS_SHARED);
+	pthread_mutexattr_setrobust(&mutex_attr, PTHREAD_MUTEX_ROBUST);
+	pthread_mutex_init(&shm->s_notifier.rn_ready_mtx, &mutex_attr);
+
+	pthread_condattr_init(&cond_attr);
+	pthread_condattr_setpshared(&cond_attr, PTHREAD_PROCESS_SHARED);
+	pthread_cond_init(&shm->s_notifier.rn_ready_cond, &cond_attr);
 
 	return shm;
 }
@@ -428,6 +465,9 @@ static void producer_proc(void *shdata, const char *ifa, const char *ifb)
 
 	/* main loop */
 	signal(SIGINT, sigint_h);
+	set_event_broadcast(shm->s_notifier.rn_ready = 1,
+			    &shm->s_notifier.rn_ready_mtx,
+			    &shm->s_notifier.rn_ready_cond);
 	while (!do_abort) {
 		int ret, i;
 
@@ -850,10 +890,10 @@ main(int argc, char **argv)
 {
 	u_int burst = 1024, wait_link = 4;
 	char *ifa = NULL, *ifb = NULL;
+	int __unused nqueues = 0;
 	char ifabuf[64] = { 0 };
 	int loopback = 0;
 	int ch, ret;
-	int __unused nqueues = 0;
 	void *shmem;
 	pthread_t th;
 
@@ -937,6 +977,11 @@ main(int argc, char **argv)
 		if (ret)
 			die("failed to create thread\n");
 	} else {
+		struct shm_struct *shm = shmem;
+
+		wait_event(shm->s_notifier.rn_ready,
+			   &shm->s_notifier.rn_ready_mtx,
+			   &shm->s_notifier.rn_ready_cond);
 		consumer_proc(shmem);
 	}
 	pthread_join(th, NULL);

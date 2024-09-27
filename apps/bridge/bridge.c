@@ -69,6 +69,7 @@ static void do_poll(struct ifpair *ifp, u_int burst,
 		    struct shm_struct *shm,
 		    const char *msg_a2b,
 		    const char *msg_b2a);
+static void create_producer_receivers(void *shmem);
 
 struct poll_port {
 	struct nmport_d *nmport;
@@ -275,7 +276,8 @@ pkt_ring_wake(struct pkt_ring *pr)
 static void
 pkt_ring_wait(struct pkt_ring *pr)
 {
-	printf("%s(%s): before sleeping\n", __func__, pr->p_name);
+	printf("%s(%s): before sleeping on pkt_ring %p\n", __func__,
+	       pr->p_name, pr);
 	pthread_mutex_lock(&pr->p_mtx);
 	while (ring_len(&pr->p_ring) <= 0) {
 
@@ -465,6 +467,7 @@ static void producer_proc(void *shdata, const char *ifa, const char *ifb)
 
 	/* main loop */
 	signal(SIGINT, sigint_h);
+	create_producer_receivers(shdata);
 	set_event_broadcast(shm->s_notifier.rn_ready = 1,
 			    &shm->s_notifier.rn_ready_mtx,
 			    &shm->s_notifier.rn_ready_cond);
@@ -550,28 +553,60 @@ static void print_pkt(char *rxbuf, const char *msg, uint16_t rx_ring,
 
 static void *producer_receive_soft(void *shdata)
 {
-	struct pkt_port *ipr = shdata;
+	struct shm_struct *shm = shdata;
+	struct pkt_port *pb = &shm->s_pb;
 
-	printf("producer receive sw\n");
+	printf("producer receive sw pb::tx %p\n", &pb->pi_tx);
+	pkt_ring_wait(&pb->pi_tx);
+	printf("producer receive sw woken\n");
 	return NULL;
 }
 
 static void *producer_receive_hard(void *shdata)
 {
-	struct pkt_port *ipr = shdata;
+	struct shm_struct *shm = shdata;
+	struct pkt_port *pa = &shm->s_pa;
 
-	printf("producer receive hw\n");
+	printf("producer receive hw pa::tx %p\n", &pa->pi_tx);
+	pkt_ring_wait(&pa->pi_tx);
+	printf("producer receive hw woken\n");
 	return NULL;
+}
+
+static void create_producer_receivers(void *shmem)
+{
+	pthread_t th;
+	int ret;
+
+	ret = pthread_create(&th, NULL, producer_receive_soft, shmem);
+	if (ret)
+		die("failed to create sw thread\n");
+	ret = pthread_create(&th, NULL, producer_receive_hard, shmem);
+	if (ret)
+		die("failed to create hw thread\n");
 }
 
 static void *consumer_proc_rxhw(void *shdata)
 {
 	struct shm_struct *shm = shdata;
 	struct pkt_port *pa = &shm->s_pa;
+	struct pkt_port *pb = &shm->s_pb;
+	unsigned int len;
+	char buf[2048];
 
 	for (;;) {
+		printf("rxhw waiting for pkt\n");
 		pkt_ring_wait(&pa->pi_rx);
+		len = ring_get(&pa->pi_rx.p_ring, buf, sizeof(buf));
+		printf("%s %u pid: %ld\n", __func__, len, (long)getpid());
+
+		len = ring_put(&pb->pi_tx.p_ring, buf, len);
+		printf("put %s %u unused %lu pb::tx %p\n", __func__, len,
+		       ring_unused(&pb->pi_rx.p_ring), &pb->pi_tx);
+		sleep(1);
+		pkt_ring_wake(&pb->pi_tx);
 	}
+	return NULL;
 }
 
 static void *consumer_proc_rxsw(void *shdata)
@@ -580,15 +615,18 @@ static void *consumer_proc_rxsw(void *shdata)
 	struct pkt_port *pb = &shm->s_pb;
 
 	for (;;) {
+		printf("rxsw waiting for pkt\n");
 		pkt_ring_wait(&pb->pi_rx);
+		sleep(2);
 	}
+	return NULL;
 }
 
 static void consumer_proc(void *shdata)
 {
 	struct pkt_port *ipr = shdata;
-	struct ring *r = &ipr->pi_rx.p_ring;
-	struct ring *x = &ipr->pi_tx.p_ring;
+	struct ring __unused *r = &ipr->pi_rx.p_ring;
+	struct ring __unused *x = &ipr->pi_tx.p_ring;
 	pthread_t thhw, thsw;
 	int ret;
 
@@ -661,8 +699,8 @@ rings_move(struct netmap_ring *rxring, struct netmap_ring *txring,
 		} else {
 			char *txbuf = NETMAP_BUF(txring, ts->buf_idx);
 			char *rxbuf = NETMAP_BUF(rxring, rs->buf_idx);
-			struct ring *r = &shm->s_pa.pi_rx.p_ring;
-			struct ring *x = &shm->s_pa.pi_tx.p_ring;
+			struct ring *r;
+			struct ring *x;
 			struct pkt_port *rxp, *txp;
 			unsigned long len = 33;
 
@@ -671,7 +709,6 @@ rings_move(struct netmap_ring *rxring, struct netmap_ring *txring,
 			r = &rxp->pi_rx.p_ring;
 			x = &txp->pi_tx.p_ring;
 			ring_put(r, rxbuf, ts->len);
-			len = ring_get(r, txbuf, ts->len);
 			print_pkt(rxbuf, msg, rxring->ringid, txring->ringid);
 			pkt_ring_wake(&rxp->pi_rx);
 			/* nm_pkt_copy(p, txbuf, ts->len); */
@@ -872,7 +909,6 @@ main(int argc, char **argv)
 	int loopback = 0;
 	int ch, ret;
 	void *shmem;
-	pthread_t th;
 
 	while ((ch = getopt(argc, argv, "hb:ci:q:vw:L")) != -1) {
 		switch (ch) {
@@ -950,9 +986,6 @@ main(int argc, char **argv)
 	shmem = mem_init(4);
 	if (fork_or_die()) {
 		producer_proc(shmem, ifa, ifb);
-		ret = pthread_create(&th, NULL, producer_receive_soft, shmem);
-		if (ret)
-			die("failed to create thread\n");
 	} else {
 		struct shm_struct *shm = shmem;
 
@@ -961,7 +994,6 @@ main(int argc, char **argv)
 			   &shm->s_notifier.rn_ready_cond);
 		consumer_proc(shmem);
 	}
-	pthread_join(th, NULL);
 	mem_destroy(shmem, 4);
 
 	return (0);

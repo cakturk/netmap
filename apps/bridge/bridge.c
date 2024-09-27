@@ -367,7 +367,7 @@ mem_destroy(void *shmem, int nrconsumer)
 	shm_unlink("/pkt_memory");
 }
 
-static void parent_proc(void *shdata)
+static void __unused parent_proc(void *shdata)
 {
 	char buf[1500];
 	int got;
@@ -386,7 +386,7 @@ static void parent_proc(void *shdata)
 	printf("parent: parent woken up got %d '%.*s'\n", got, 17, buf);
 }
 
-static void child_proc(void *shdata)
+static void __unused child_proc(void *shdata)
 {
 	struct pkt_port *ipr = shdata;
 	struct ring *r = &ipr->pi_rx.p_ring;
@@ -555,10 +555,28 @@ static void *producer_receive_soft(void *shdata)
 {
 	struct shm_struct *shm = shdata;
 	struct pkt_port *pb = &shm->s_pb;
+	struct netmap_ring *sw_txring;
+	struct netmap_slot *ts;
+	unsigned int len;
+	char buf[2048];
+	char *txbuf;
+	u_int k;
+
+	sw_txring = pb->pi_tx.p_nmring;
+	k = sw_txring->head;
+	ts = &sw_txring->slot[k];
+	txbuf = NETMAP_BUF(sw_txring, ts->buf_idx);
 
 	printf("producer receive sw pb::tx %p\n", &pb->pi_tx);
 	pkt_ring_wait(&pb->pi_tx);
-	printf("producer receive sw woken\n");
+	len = ring_get(&pb->pi_tx.p_ring, buf, sizeof(buf));
+	if (len > 0) {
+		ts->len = len;
+		nm_pkt_copy(buf, txbuf, len);
+		k = nm_ring_next(sw_txring, k);
+		sw_txring->head = sw_txring->cur = k;
+	}
+	printf("producer receive sw woken with pkt len %u\n", len);
 	return NULL;
 }
 
@@ -599,7 +617,8 @@ static void *consumer_proc_rxhw(void *shdata)
 		pkt_ring_wait(&pa->pi_rx);
 		len = ring_get(&pa->pi_rx.p_ring, buf, sizeof(buf));
 		printf("%s %u pid: %ld\n", __func__, len, (long)getpid());
-
+		if (len <= 0)
+			continue;
 		len = ring_put(&pb->pi_tx.p_ring, buf, len);
 		printf("put %s %u unused %lu pb::tx %p\n", __func__, len,
 		       ring_unused(&pb->pi_rx.p_ring), &pb->pi_tx);
@@ -697,12 +716,11 @@ rings_move(struct netmap_ring *rxring, struct netmap_ring *txring,
 			rs->flags |= NS_BUF_CHANGED;
 			print_pkt(rxbuf, msg, rxring->ringid, txring->ringid);
 		} else {
-			char *txbuf = NETMAP_BUF(txring, ts->buf_idx);
+			char __unused *txbuf = NETMAP_BUF(txring, ts->buf_idx);
 			char *rxbuf = NETMAP_BUF(rxring, rs->buf_idx);
 			struct ring *r;
-			struct ring *x;
+			struct ring __unused *x;
 			struct pkt_port *rxp, *txp;
-			unsigned long len = 33;
 
 			rxp = rxport(shm, rxring);
 			txp = txport(shm, txring);
@@ -719,10 +737,10 @@ rings_move(struct netmap_ring *rxring, struct netmap_ring *txring,
 		 */
 		ts->flags = (ts->flags & ~NS_MOREFRAG) | (rs->flags & NS_MOREFRAG);
 		j = nm_ring_next(rxring, j);
-		k = nm_ring_next(txring, k);
+		/* k = nm_ring_next(txring, k); */
 	}
 	rxring->head = rxring->cur = j;
-	txring->head = txring->cur = k;
+	/* txring->head = txring->cur = k; */
 	if (0)
 	if (verbose && m > 0)
 		D("%s fwd %d packets: rxring %u --> txring %u",
@@ -907,7 +925,7 @@ main(int argc, char **argv)
 	int __unused nqueues = 0;
 	char ifabuf[64] = { 0 };
 	int loopback = 0;
-	int ch, ret;
+	int ch;
 	void *shmem;
 
 	while ((ch = getopt(argc, argv, "hb:ci:q:vw:L")) != -1) {

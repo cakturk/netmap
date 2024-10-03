@@ -33,14 +33,18 @@
 #define	nelem(x) (sizeof(x)/sizeof((x)[0]))
 #endif
 
+#ifndef __aligned
+#define __aligned(x)	__attribute__((aligned(x)))
+#endif
+
 struct ring_pkt {
 	unsigned int len;
 	char data[2040];
 };
 
 struct ring {
-	unsigned int r;
-	unsigned int w;
+	volatile unsigned int r __aligned(64);
+	volatile unsigned int w __aligned(64);
 	struct ring_pkt pkts[1024];
 };
 

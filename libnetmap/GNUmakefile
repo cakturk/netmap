@@ -1,8 +1,9 @@
 SRCDIR ?= ../
 PREFIX ?= usr/local
-CFLAGS=-O0 -pipe -Wall -Werror
+CFLAGS=-O2 -pipe -Wall -Werror
 CFLAGS +=-g
 CFLAGS += -I $(SRCDIR)/sys
+CFLAGS += -DNMREQ_DEBUG
 VPATH = $(SRCDIR)/libnetmap
 SRCS=$(notdir $(wildcard $(SRCDIR)/libnetmap/*.c))
 OBJS=$(SRCS:.c=.o)

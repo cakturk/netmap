@@ -107,9 +107,10 @@ die(const char *fmt, ...)
 	va_start(params, fmt);
 	vfprintf(stderr, fmt, params);
 	va_end(params);
+	exit(1);
 }
 
-static pid_t fork_or_die(void)
+static pid_t __unused fork_or_die(void)
 {
 	pid_t pid;
 
@@ -296,8 +297,9 @@ static void pkt_port_init(struct pkt_port *p, struct nmport_d *nmp)
 	p->pi_rx.p_nmring = NETMAP_RXRING(nmp->nifp, nmp->first_rx_ring);
 	p->pi_tx.p_nmring = NETMAP_TXRING(nmp->nifp, nmp->first_tx_ring);
 
-	printf("first rx %u first tx %u\n", nmp->first_rx_ring,
-	       nmp->first_tx_ring);
+	printf("first rx %u-%u first tx %u-%u\n",
+	       nmp->first_rx_ring, nmp->last_rx_ring,
+	       nmp->first_tx_ring, nmp->last_tx_ring);
 
 	pkt_ring_init(&p->pi_rx, 1, nmp->first_rx_ring);
 	pkt_ring_init(&p->pi_tx, 0, nmp->first_tx_ring);
@@ -339,8 +341,10 @@ mem_init(int nconsumer)
 	struct shm_struct *shm;
 	int fd;
 
-	if ((fd = shm_open("/pkt_memory", O_CREAT | O_RDWR, 0666)) < 0)
-		die("failed to shm_open\n");
+	if ((fd = shm_open("/pkt_memory", O_CREAT | O_RDWR, 0666)) < 0) {
+		shm_unlink("/pkt_memory");
+		die("failed to shm_open: %s (%d)\n", strerror(errno), fd);
+	}
 	if (ftruncate(fd, sizeof(*shm) * nconsumer) != 0)
 		die("failed to ftruncate\n");
 	shm = mmap(NULL, sizeof(*shm) * nconsumer,
@@ -405,16 +409,6 @@ static void __unused child_proc(void *shdata)
 	pthread_mutex_unlock(&ipr->pi_rx.p_mtx);
 }
 
-struct producer_thread_args {
-	void *shdata;
-	const char *ifa, *ifb;
-};
-
-static void *producer_thread(struct producer_thread_args *args)
-{
-	return NULL;
-}
-
 static void producer_proc(void *shdata, const char *ifa, const char *ifb)
 {
 	struct shm_struct *shm = shdata;
@@ -464,9 +458,10 @@ static void producer_proc(void *shdata, const char *ifa, const char *ifb)
 
 	D("Wait %d secs for link to come up...", wait_link);
 	/* sleep(wait_link); */
-	D("Ready to go, %s 0x%x/%d <-> %s 0x%x/%d.",
+	D("Ready to go, %s 0x%x/%d <-> %s 0x%x/%d. host %d %d",
 		pa->hdr.nr_name, pa->first_rx_ring, pa->reg.nr_rx_rings,
-		pb->hdr.nr_name, pb->first_rx_ring, pb->reg.nr_rx_rings);
+		pb->hdr.nr_name, pb->first_rx_ring, pb->reg.nr_rx_rings,
+		pb->nifp->ni_host_tx_rings, pb->nifp->ni_host_tx_rings);
 
 	pa_sw_rings = (pa->reg.nr_mode == NR_REG_SW ||
 	    pa->reg.nr_mode == NR_REG_ONE_SW);
@@ -520,6 +515,18 @@ static void producer_proc(void *shdata, const char *ifa, const char *ifb)
 	}
 	nmport_close(pb);
 	nmport_close(pa);
+}
+
+struct producer_thread_args {
+	void *shdata;
+	const char *ifa, *ifb;
+};
+
+static void __unused *producer_thread(void *pargs)
+{
+	struct producer_thread_args *args = pargs;
+	producer_proc(args->shdata, args->ifa, args->ifb);
+	return NULL;
 }
 
 static void print_pkt(const char *prefix, char *rxbuf, const char *msg,
@@ -1060,9 +1067,26 @@ main(int argc, char **argv)
 		/* two different interfaces. Take all rings on if1 */
 	}
 	shmem = mem_init(4);
+#if 0
+	{
+		pthread_t th;
+		int ret;
+		struct producer_thread_args args = {
+			.shdata = shmem,
+			.ifa = ifa,
+			.ifb = ifb
+		};
+		ret = pthread_create(&th, NULL, producer_thread, &args);
+		if (ret)
+			die("failed to create producer thread\n");
+	}
+#else
 	if (fork_or_die()) {
 		producer_proc(shmem, ifa, ifb);
-	} else {
+	}
+	else
+#endif
+	{
 		struct shm_struct *shm = shmem;
 
 		wait_event(shm->s_notifier.rn_ready,

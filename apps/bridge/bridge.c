@@ -490,8 +490,9 @@ static void producer_proc(void *shdata, const char *ifa, const char *ifb)
 #ifdef BUSYWAIT
 		ret = 1;
 #else  /* !defined(BUSYWAIT) */
-		ret = poll(pollfd, 2, 2500);
+		ret = poll(pollfd, 2, 1);
 #endif /* !defined(BUSYWAIT) */
+		if (0)
 		if (ret <= 0)
 		if (ret <= 0 || verbose)
 		    D("poll %s [0] ev %x %x rx %d@%d tx %d,"

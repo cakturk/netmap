@@ -8,7 +8,6 @@
  *
  * $FreeBSD$
  */
-
 #include <libnetmap.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -100,6 +99,17 @@ static inline int ip_hdrlen(struct ip *ih)
 }
 
 static void
+panic(const char *fmt, ...)
+{
+	va_list params;
+
+	va_start(params, fmt);
+	vfprintf(stderr, fmt, params);
+	va_end(params);
+	abort();
+}
+
+static void
 die(const char *fmt, ...)
 {
 	va_list params;
@@ -120,6 +130,7 @@ static pid_t __unused fork_or_die(void)
 	case -1:
 		die("unable to fork: %s", strerror(errno));
 	default:
+		break;
 	}
 	return pid;
 }
@@ -297,9 +308,11 @@ static void pkt_port_init(struct pkt_port *p, struct nmport_d *nmp)
 	p->pi_rx.p_nmring = NETMAP_RXRING(nmp->nifp, nmp->first_rx_ring);
 	p->pi_tx.p_nmring = NETMAP_TXRING(nmp->nifp, nmp->first_tx_ring);
 
-	printf("first rx %u-%u first tx %u-%u\n",
+	printf("first rx %u-%u first tx %u-%u num rx/tx: %u/%u num host rx/tx: %u/%u\n",
 	       nmp->first_rx_ring, nmp->last_rx_ring,
-	       nmp->first_tx_ring, nmp->last_tx_ring);
+	       nmp->first_tx_ring, nmp->last_tx_ring,
+	       nmp->nifp->ni_rx_rings, nmp->nifp->ni_tx_rings,
+	       nmp->nifp->ni_host_rx_rings, nmp->nifp->ni_host_tx_rings);
 
 	pkt_ring_init(&p->pi_rx, 1, nmp->first_rx_ring);
 	pkt_ring_init(&p->pi_tx, 0, nmp->first_tx_ring);
@@ -316,7 +329,7 @@ static struct pkt_port *rxport(struct shm_struct *shm,
 	if (shm->s_pb.pi_rx.p_nmring == rxring)
 		return &shm->s_pb;
 
-	abort();
+	panic("rxport: invalid port\n");
 	return NULL;
 }
 
@@ -329,7 +342,7 @@ static struct pkt_port *txport(struct shm_struct *shm,
 	if (shm->s_pb.pi_tx.p_nmring == txring)
 		return &shm->s_pb;
 
-	abort();
+	panic("txport: invalid port\n");
 	return NULL;
 }
 
@@ -589,7 +602,7 @@ static void *producer_receive_soft(void *shdata)
 
 	sw_txring = pb->pi_tx.p_nmring;
 	for (;;) {
-		int ret;
+		int ret = 0;
 		/* printf("producer receive sw pb::tx %p\n", &pb->pi_tx); */
 		pkt_ring_wait(&pb->pi_tx);
 
@@ -602,7 +615,7 @@ static void *producer_receive_soft(void *shdata)
 			nm_pkt_copy(buf, txbuf, len);
 			k = nm_ring_next(sw_txring, k);
 			sw_txring->head = sw_txring->cur = k;
-			ret = ioctl(pb->pi_nmp->fd, NIOCRXSYNC, NULL);
+			/* ret = ioctl(pb->pi_nmp->fd, NIOCRXSYNC, NULL); */
 			printf("producer receive sw woken with pkt len %u empty: %d space %d fd: %d ret %d\n",
 			       len, nm_ring_empty(sw_txring), nm_ring_space(sw_txring),
 			       pb->pi_nmp->fd, ret);
@@ -624,7 +637,7 @@ static void *producer_receive_hard(void *shdata)
 
 	hw_txring = pa->pi_tx.p_nmring;
 	for (;;) {
-		int ret;
+		int ret = 0;
 		/* printf("producer receive hw pa::tx %p\n", &pa->pi_tx); */
 		pkt_ring_wait(&pa->pi_tx);
 
@@ -637,7 +650,7 @@ static void *producer_receive_hard(void *shdata)
 			nm_pkt_copy(buf, txbuf, len);
 			k = nm_ring_next(hw_txring, k);
 			hw_txring->head = hw_txring->cur = k;
-			ret = ioctl(pa->pi_nmp->fd, NIOCRXSYNC, NULL);
+			/* ret = ioctl(pa->pi_nmp->fd, NIOCRXSYNC, NULL); */
 			printf("producer receive hw woken with pkt len %u empty: %d space %d fd: %d ret %d\n",
 			       len, nm_ring_empty(hw_txring), nm_ring_space(hw_txring),
 			       pa->pi_nmp->fd, ret);

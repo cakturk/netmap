@@ -17,7 +17,7 @@ CFLAGS += -Wextra
 
 LDFLAGS += -L $(BUILDDIR)/build-libnetmap
 $(info ldflags: $(LDFLAGS))
-LDLIBS += -lnetmap
+LDLIBS += -lnetmap -lpthread
 ifeq ($(shell uname),Linux)
 	LDLIBS += -lrt	# on linux
 endif

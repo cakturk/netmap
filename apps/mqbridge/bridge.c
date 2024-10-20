@@ -98,7 +98,7 @@ static inline int ip_hdrlen(struct ip *ih)
 	return ih->ip_hl * 4;
 }
 
-static void
+static void __attribute__((noreturn))
 panic(const char *fmt, ...)
 {
 	va_list params;
@@ -109,7 +109,7 @@ panic(const char *fmt, ...)
 	abort();
 }
 
-static void
+static void __attribute__((noreturn))
 die(const char *fmt, ...)
 {
 	va_list params;
@@ -255,8 +255,10 @@ struct shm_struct {
 		int rn_ready;
 	} s_notifier;
 
-	struct pkt_port s_pa;
-	struct pkt_port s_pb;
+	struct pkt_port *s_pa;
+	struct pkt_port *s_pb;
+
+	struct pkt_port s_ports[];
 };
 
 static void
@@ -323,45 +325,45 @@ static void pkt_port_init(struct pkt_port *p, struct nmport_d *nmp)
 static struct pkt_port *rxport(struct shm_struct *shm,
 			       struct netmap_ring *rxring)
 {
-	if (shm->s_pa.pi_rx.p_nmring == rxring)
-		return &shm->s_pa;
+	if (shm->s_pa->pi_rx.p_nmring == rxring)
+		return shm->s_pa;
 
-	if (shm->s_pb.pi_rx.p_nmring == rxring)
-		return &shm->s_pb;
+	if (shm->s_pb->pi_rx.p_nmring == rxring)
+		return shm->s_pb;
 
 	panic("rxport: invalid port\n");
-	return NULL;
 }
 
 static struct pkt_port *txport(struct shm_struct *shm,
 			       struct netmap_ring *txring)
 {
-	if (shm->s_pa.pi_tx.p_nmring == txring)
-		return &shm->s_pa;
+	if (shm->s_pa->pi_tx.p_nmring == txring)
+		return shm->s_pa;
 
-	if (shm->s_pb.pi_tx.p_nmring == txring)
-		return &shm->s_pb;
+	if (shm->s_pb->pi_tx.p_nmring == txring)
+		return shm->s_pb;
 
 	panic("txport: invalid port\n");
-	return NULL;
 }
 
 static void *
-mem_init(int nconsumer)
+mem_init(int nr_rings)
 {
 	pthread_mutexattr_t mutex_attr;
 	pthread_condattr_t cond_attr;
 	struct shm_struct *shm;
+	size_t length;
 	int fd;
+
+	length = sizeof(*shm) + sizeof(*shm->s_pa) * nr_rings * 2;
 
 	if ((fd = shm_open("/pkt_memory", O_CREAT | O_RDWR, 0666)) < 0) {
 		shm_unlink("/pkt_memory");
 		die("failed to shm_open: %s (%d)\n", strerror(errno), fd);
 	}
-	if (ftruncate(fd, sizeof(*shm) * nconsumer) != 0)
+	if (ftruncate(fd, length) != 0)
 		die("failed to ftruncate\n");
-	shm = mmap(NULL, sizeof(*shm) * nconsumer,
-		      PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	shm = mmap(NULL, length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 	if (shm == MAP_FAILED)
 		die("%s: failed to mmap shared mem\n", __func__);
 	close(fd);
@@ -374,6 +376,9 @@ mem_init(int nconsumer)
 	pthread_condattr_init(&cond_attr);
 	pthread_condattr_setpshared(&cond_attr, PTHREAD_PROCESS_SHARED);
 	pthread_cond_init(&shm->s_notifier.rn_ready_cond, &cond_attr);
+
+	shm->s_pa = &shm->s_ports[0];
+	shm->s_pb = &shm->s_ports[nr_rings];
 
 	return shm;
 }
@@ -422,15 +427,79 @@ static void __unused child_proc(void *shdata)
 	pthread_mutex_unlock(&ipr->pi_rx.p_mtx);
 }
 
+static int get_ring_count(const char *ifname)
+{
+	struct nmport_d *nmd;
+	int nr_ring = -1;
+
+	/* Open the network interface using nmport_open */
+	nmd = nmport_open(ifname);
+	if (!nmd) {
+		perror("nmport_open failed");
+		return -1;
+	}
+
+	/* Check if the RX and TX ring counts are equal */
+	if (nmd->nifp->ni_rx_rings != nmd->nifp->ni_tx_rings) {
+		fprintf(stderr, "error: RX and TX ring counts are not equal.\n");
+		nmport_close(nmd);
+		goto out_close;
+	}
+
+	/* Retrieve the number of rings (they are equal if we reached here) */
+	nr_ring = nmd->nifp->ni_rx_rings;
+
+out_close:
+	/* Close the nmport */
+	nmport_close(nmd);
+
+	return nr_ring;
+}
+
 static void producer_proc(void *shdata, const char *ifa, const char *ifb)
 {
+	char msg_a2b[256], msg_b2a[256], buf[256];
 	struct shm_struct *shm = shdata;
-	char msg_a2b[256], msg_b2a[256];
 	struct pollfd pollfd[2];
 	u_int burst = 1024, wait_link = 4;
 	struct nmport_d *pa = NULL, *pb = NULL;
 	int pa_sw_rings, pb_sw_rings;
 	int nifps = 0;
+	int nr_rings, i;
+
+
+	if ((nr_rings = get_ring_count(ifa)) < 0)
+		die("failed to get number of rings: %s", strerror(errno));
+
+	for (i = 0; 0 && i < nr_rings; i++) {
+		/*
+		 * TODO: It is currently assumed that the first port is always
+		 * the hardware ring, but we need to address this.
+		 */
+		if (nr_rings > 1)
+			snprintf(buf, sizeof(buf), "%s-%d@conf:host-rings=%d",
+				 ifa, i, nr_rings);
+		else
+			strcpy(buf, ifa);
+		printf("pa '%s'\n", buf);
+
+		pa = nmport_open(buf);
+		if (pa == NULL)
+			die("cannot open %s", buf);
+
+		if (nr_rings > 1)
+			snprintf(buf, sizeof(buf), "%s%d@conf:host-rings=%d",
+				 ifb, i, nr_rings);
+		else
+			strcpy(buf, ifb);
+
+		pb = nmport_open(buf);
+		printf("pb '%s'\n", buf);
+		if (pb == NULL)
+			die("cannot open %s", buf);
+	}
+	/* printf("pa %p pb %p\n", pa, pb); */
+	/* return; */
 
 	pa = nmport_open(ifa);
 	if (pa == NULL) {
@@ -445,8 +514,8 @@ static void producer_proc(void *shdata, const char *ifa, const char *ifb)
 		exit(1);
 	}
 
-	pkt_port_init(&shm->s_pa, pa);
-	pkt_port_init(&shm->s_pb, pb);
+	pkt_port_init(shm->s_pa, pa);
+	pkt_port_init(shm->s_pb, pb);
 
 	zerocopy = zerocopy && (pa->mem == pb->mem);
 	D("------- zerocopy %ssupported", zerocopy ? "" : "NOT ");
@@ -592,7 +661,7 @@ static void print_pkt(const char *prefix, char *rxbuf, const char *msg,
 static void *producer_receive_soft(void *shdata)
 {
 	struct shm_struct *shm = shdata;
-	struct pkt_port *pb = &shm->s_pb;
+	struct pkt_port *pb = shm->s_pb;
 	struct netmap_ring *sw_txring;
 	struct netmap_slot *ts;
 	unsigned int len;
@@ -627,7 +696,7 @@ static void *producer_receive_soft(void *shdata)
 static void *producer_receive_hard(void *shdata)
 {
 	struct shm_struct *shm = shdata;
-	struct pkt_port *pa = &shm->s_pa;
+	struct pkt_port *pa = shm->s_pa;
 	struct netmap_ring *hw_txring;
 	struct netmap_slot *ts;
 	unsigned int len;
@@ -675,8 +744,8 @@ static void create_producer_receivers(void *shmem)
 static void *consumer_proc_rxhw(void *shdata)
 {
 	struct shm_struct *shm = shdata;
-	struct pkt_port *pa = &shm->s_pa;
-	struct pkt_port *pb = &shm->s_pb;
+	struct pkt_port *pa = shm->s_pa;
+	struct pkt_port *pb = shm->s_pb;
 	unsigned int len;
 	char buf[2048];
 
@@ -699,8 +768,8 @@ static void *consumer_proc_rxhw(void *shdata)
 static void *consumer_proc_rxsw(void *shdata)
 {
 	struct shm_struct *shm = shdata;
-	struct pkt_port *pa = &shm->s_pa;
-	struct pkt_port *pb = &shm->s_pb;
+	struct pkt_port *pa = shm->s_pa;
+	struct pkt_port *pb = shm->s_pb;
 	unsigned int len;
 	char buf[2048];
 

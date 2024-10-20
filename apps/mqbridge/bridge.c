@@ -69,6 +69,8 @@ static void do_poll(struct ifpair *ifp, u_int burst,
 		    const char *msg_a2b,
 		    const char *msg_b2a);
 static void create_producer_receivers(void *shmem);
+static void print_pkt(const char *prefix, char *rxbuf, const char *msg,
+		      uint16_t rx_ring, uint16_t tx_ring, u_int len);
 
 struct poll_port {
 	struct nmport_d *nmport;
@@ -224,6 +226,13 @@ typedef struct {
 	pthread_cond_t not_empty;
 	pthread_cond_t not_full;
 } shared_data_t;
+
+#define NR_MAX_QUEUES 16
+
+struct thread_args {
+	struct nmport_d *hw_port;
+	struct nmport_d *host_port;
+};
 
 struct pkt_ring {
 	char p_name[16];
@@ -456,7 +465,218 @@ out_close:
 	return nr_ring;
 }
 
-static void producer_proc(void *shdata, const char *ifa, const char *ifb)
+/*
+ * Move up to 'limit' pkts from rxring to txring, swapping buffers
+ * if zerocopy is possible. Otherwise fall back on packet copying.
+ */
+static int
+mq_rings_move(struct netmap_ring *rxring, struct netmap_ring *txring,
+	      u_int limit, const char *msg)
+{
+	u_int j, k, m = 0;
+
+	/* print a warning if any of the ring flags is set (e.g. NM_REINIT) */
+	if (rxring->flags || txring->flags)
+		D("%s rxflags %x txflags %x",
+		    msg, rxring->flags, txring->flags);
+	j = rxring->head; /* RX */
+	k = txring->head; /* TX */
+	m = nm_ring_space(rxring);
+	if (m < limit)
+		limit = m;
+	m = nm_ring_space(txring);
+	if (m < limit)
+		limit = m;
+	m = limit;
+	while (limit-- > 0) {
+		struct netmap_slot *rs = &rxring->slot[j];
+		struct netmap_slot *ts = &txring->slot[k];
+
+		if (ts->buf_idx < 2 || rs->buf_idx < 2) {
+			RD(2, "wrong index rxr[%d] = %d  -> txr[%d] = %d",
+			    j, rs->buf_idx, k, ts->buf_idx);
+			sleep(2);
+		}
+		/* Copy the packet length. */
+		if (rs->len > rxring->nr_buf_size) {
+			RD(2,  "%s: invalid len %u, rxr[%d] -> txr[%d]",
+			    msg, rs->len, j, k);
+			rs->len = 0;
+		} else if (verbose > 1) {
+			D("%s: fwd len %u, rx[%d] -> tx[%d]",
+			    msg, rs->len, j, k);
+		}
+		ts->len = rs->len;
+		if (zerocopy) {
+			char *rxbuf = NETMAP_BUF(rxring, rs->buf_idx);
+			uint32_t pkt = ts->buf_idx;
+			ts->buf_idx = rs->buf_idx;
+			rs->buf_idx = pkt;
+			/* report the buffer change. */
+			ts->flags |= NS_BUF_CHANGED;
+			rs->flags |= NS_BUF_CHANGED;
+			print_pkt("mq", rxbuf, msg, rxring->ringid, txring->ringid, ts->len);
+		} else {
+			char *rxbuf = NETMAP_BUF(rxring, rs->buf_idx);
+			char *txbuf = NETMAP_BUF(txring, ts->buf_idx);
+			nm_pkt_copy(rxbuf, txbuf, ts->len);
+			print_pkt("mq", rxbuf, msg, rxring->ringid, txring->ringid, ts->len);
+		}
+		/*
+		 * Copy the NS_MOREFRAG from rs to ts, leaving any
+		 * other flags unchanged.
+		 */
+		ts->flags = (ts->flags & ~NS_MOREFRAG) | (rs->flags & NS_MOREFRAG);
+		j = nm_ring_next(rxring, j);
+		k = nm_ring_next(txring, k);
+	}
+	rxring->head = rxring->cur = j;
+	txring->head = txring->cur = k;
+	if (verbose && m > 0)
+		D("%s fwd %d packets: rxring %u --> txring %u",
+		    msg, m, rxring->ringid, txring->ringid);
+
+	return (m);
+}
+
+/* Move packets from source port to destination port. */
+static int
+mq_ports_move(struct nmport_d *src, struct nmport_d *dst, u_int limit,
+	const char *msg)
+{
+	struct netmap_ring *txring, *rxring;
+	u_int m = 0, si = src->first_rx_ring, di = dst->first_tx_ring;
+
+	while (si <= src->last_rx_ring && di <= dst->last_tx_ring) {
+		rxring = NETMAP_RXRING(src->nifp, si);
+		txring = NETMAP_TXRING(dst->nifp, di);
+		if (nm_ring_empty(rxring)) {
+			si++;
+			continue;
+		}
+		if (nm_ring_empty(txring)) {
+			di++;
+			continue;
+		}
+		m += mq_rings_move(rxring, txring, limit, msg);
+	}
+	return (m);
+}
+
+static void mq_bridge_pkts(struct nmport_d *pa, struct nmport_d *pb)
+{
+	char msg_a2b[256], msg_b2a[256];
+	int pa_sw_rings, pb_sw_rings;
+	struct pollfd pollfd[2];
+	u_int burst = 1024;
+	int n0, n1, ret;
+
+	pa_sw_rings = (pa->reg.nr_mode == NR_REG_SW ||
+	    pa->reg.nr_mode == NR_REG_ONE_SW);
+	pb_sw_rings = (pb->reg.nr_mode == NR_REG_SW ||
+	    pb->reg.nr_mode == NR_REG_ONE_SW);
+
+	snprintf(msg_a2b, sizeof(msg_a2b), "%s:%s --> %s:%s",
+			pa->hdr.nr_name, pa_sw_rings ? "host" : "nic",
+			pb->hdr.nr_name, pb_sw_rings ? "host" : "nic");
+
+	snprintf(msg_b2a, sizeof(msg_b2a), "%s:%s --> %s:%s",
+			pb->hdr.nr_name, pb_sw_rings ? "host" : "nic",
+			pa->hdr.nr_name, pa_sw_rings ? "host" : "nic");
+
+	memset(pollfd, 0, sizeof(pollfd));
+	pollfd[0].fd = pa->fd;
+	pollfd[1].fd = pb->fd;
+
+again:
+	pollfd[0].events = pollfd[1].events = 0;
+	pollfd[0].revents = pollfd[1].revents = 0;
+	n0 = rx_slots_avail(pa);
+	n1 = rx_slots_avail(pb);
+#ifdef BUSYWAIT
+	if (n0) {
+		pollfd[1].revents = POLLOUT;
+	} else {
+		ioctl(pollfd[0].fd, NIOCRXSYNC, NULL);
+	}
+	if (n1) {
+		pollfd[0].revents = POLLOUT;
+	} else {
+		ioctl(pollfd[1].fd, NIOCRXSYNC, NULL);
+	}
+	ret = 1;
+#else  /* !defined(BUSYWAIT) */
+	if (n0)
+		pollfd[1].events |= POLLOUT;
+	else
+		pollfd[0].events |= POLLIN;
+	if (n1)
+		pollfd[0].events |= POLLOUT;
+	else
+		pollfd[1].events |= POLLIN;
+
+	/* poll() also cause kernel to txsync/rxsync the NICs */
+	ret = poll(pollfd, 2, 2500);
+#endif /* !defined(BUSYWAIT) */
+	if (ret <= 0)
+		D("poll %s [0] ev %x %x rx %d@%d tx %d,"
+		  " [1] ev %x %x rx %d@%d tx %d",
+		  ret <= 0 ? "timeout" : "ok",
+		  pollfd[0].events,
+		  pollfd[0].revents,
+		  rx_slots_avail(pa),
+		  NETMAP_RXRING(pa->nifp, pa->cur_rx_ring)->head,
+		  tx_slots_avail(pa),
+		  pollfd[1].events,
+		  pollfd[1].revents,
+		  rx_slots_avail(pb),
+		  NETMAP_RXRING(pb->nifp, pb->cur_rx_ring)->head,
+		  tx_slots_avail(pb)
+		 );
+	if (ret < 0)
+		return;
+	if (pollfd[0].revents & POLLERR) {
+		struct netmap_ring *rx = NETMAP_RXRING(pa->nifp, pa->cur_rx_ring);
+		D("error on fd0, rx [%d,%d,%d)",
+		  rx->head, rx->cur, rx->tail);
+	}
+	if (pollfd[1].revents & POLLERR) {
+		struct netmap_ring *rx = NETMAP_RXRING(pb->nifp, pb->cur_rx_ring);
+		D("error on fd1, rx [%d,%d,%d)",
+		  rx->head, rx->cur, rx->tail);
+	}
+	if (pollfd[0].revents & POLLOUT) {
+		mq_ports_move(pb, pa, burst, msg_b2a);
+#ifdef BUSYWAIT
+		ioctl(pollfd[0].fd, NIOCTXSYNC, NULL);
+#endif
+	}
+
+	if (pollfd[1].revents & POLLOUT) {
+		mq_ports_move(pa, pb, burst, msg_a2b);
+#ifdef BUSYWAIT
+		ioctl(pollfd[1].fd, NIOCTXSYNC, NULL);
+#endif
+	}
+
+	/*
+	 * We don't need ioctl(NIOCTXSYNC) on the two file descriptors.
+	 * here. The kernel will txsync on next poll().
+	 */
+	goto again;
+}
+
+static void *mq_bridge_pkts_thread(void *arg)
+{
+	struct thread_args *args = arg;
+
+	mq_bridge_pkts(args->hw_port, args->host_port);
+	return NULL;
+}
+
+
+static void producer_proc(void *shdata, const char *ifa, const char *ifb,
+			  int nr_rings)
 {
 	char msg_a2b[256], msg_b2a[256], buf[256];
 	struct shm_struct *shm = shdata;
@@ -464,14 +684,15 @@ static void producer_proc(void *shdata, const char *ifa, const char *ifb)
 	u_int burst = 1024, wait_link = 4;
 	struct nmport_d *pa = NULL, *pb = NULL;
 	int pa_sw_rings, pb_sw_rings;
-	int nifps = 0;
-	int nr_rings, i;
+	int i, nifps = 0;
+	struct pkt_port *ppa = shm->s_pa, *ppb = shm->s_pb;
+	pthread_t threads[NR_MAX_QUEUES];
 
+	if (nr_rings > NR_MAX_QUEUES)
+		die("update NR_MAX_QUEUES value");
 
-	if ((nr_rings = get_ring_count(ifa)) < 0)
-		die("failed to get number of rings: %s", strerror(errno));
-
-	for (i = 0; 0 && i < nr_rings; i++) {
+	for (i = 0; i < nr_rings; i++, ppa++, ppb++) {
+		struct thread_args targs;
 		/*
 		 * TODO: It is currently assumed that the first port is always
 		 * the hardware ring, but we need to address this.
@@ -487,6 +708,8 @@ static void producer_proc(void *shdata, const char *ifa, const char *ifb)
 		if (pa == NULL)
 			die("cannot open %s", buf);
 
+		pkt_port_init(ppa, pa);
+
 		if (nr_rings > 1)
 			snprintf(buf, sizeof(buf), "%s%d@conf:host-rings=%d",
 				 ifb, i, nr_rings);
@@ -497,9 +720,21 @@ static void producer_proc(void *shdata, const char *ifa, const char *ifb)
 		printf("pb '%s'\n", buf);
 		if (pb == NULL)
 			die("cannot open %s", buf);
+
+		pkt_port_init(ppb, pb);
+
+		targs.hw_port = pa;
+		targs.host_port = pb;
+
+		if (pthread_create(&threads[i], NULL, mq_bridge_pkts_thread, &targs))
+			die("failed to create producer netmap thread\n");
 	}
-	/* printf("pa %p pb %p\n", pa, pb); */
-	/* return; */
+
+	for (i = 0; i < nr_rings; i++) {
+		pthread_join(threads[i], NULL);
+	}
+	printf("pa %p pb %p\n", pa, pb);
+	return;
 
 	pa = nmport_open(ifa);
 	if (pa == NULL) {
@@ -603,12 +838,13 @@ static void producer_proc(void *shdata, const char *ifa, const char *ifb)
 struct producer_thread_args {
 	void *shdata;
 	const char *ifa, *ifb;
+	int nr_rings;
 };
 
 static void __unused *producer_thread(void *pargs)
 {
 	struct producer_thread_args *args = pargs;
-	producer_proc(args->shdata, args->ifa, args->ifb);
+	producer_proc(args->shdata, args->ifa, args->ifb, args->nr_rings);
 	return NULL;
 }
 
@@ -921,7 +1157,6 @@ ports_move(struct nmport_d *src, struct nmport_d *dst, u_int limit,
 	return (m);
 }
 
-
 static void
 usage(void)
 {
@@ -1070,13 +1305,13 @@ main(int argc, char **argv)
 {
 	u_int burst = 1024, wait_link = 4;
 	char *ifa = NULL, *ifb = NULL;
-	int __unused nqueues = 0;
+	int nr_rings = 0;
 	char ifabuf[64] = { 0 };
 	int loopback = 0;
 	int ch;
 	void *shmem;
 
-	while ((ch = getopt(argc, argv, "hb:ci:q:vw:L")) != -1) {
+	while ((ch = getopt(argc, argv, "hb:ci:vw:L")) != -1) {
 		switch (ch) {
 		default:
 			D("bad option %c %s", ch, optarg);
@@ -1098,9 +1333,6 @@ main(int argc, char **argv)
 			break;
 		case 'c':
 			zerocopy = 0; /* do not zerocopy */
-			break;
-		case 'q':
-			nqueues = atoi(optarg);
 			break;
 		case 'v':
 			verbose++;
@@ -1149,7 +1381,11 @@ main(int argc, char **argv)
 	} else {
 		/* two different interfaces. Take all rings on if1 */
 	}
-	shmem = mem_init(4);
+
+	if ((nr_rings = get_ring_count(ifa)) < 0)
+		die("failed to get number of rings: %s", strerror(errno));
+
+	shmem = mem_init(nr_rings);
 #if 0
 	{
 		pthread_t th;
@@ -1157,7 +1393,8 @@ main(int argc, char **argv)
 		struct producer_thread_args args = {
 			.shdata = shmem,
 			.ifa = ifa,
-			.ifb = ifb
+			.ifb = ifb,
+			.nr_rings = nr_rings
 		};
 		ret = pthread_create(&th, NULL, producer_thread, &args);
 		if (ret)
@@ -1165,7 +1402,7 @@ main(int argc, char **argv)
 	}
 #else
 	if (fork_or_die()) {
-		producer_proc(shmem, ifa, ifb);
+		producer_proc(shmem, ifa, ifb, nr_rings);
 	}
 	else
 #endif

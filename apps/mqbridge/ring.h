@@ -45,7 +45,7 @@ struct ring_pkt {
 struct ring {
 	volatile unsigned int r __aligned(64);
 	volatile unsigned int w __aligned(64);
-	struct ring_pkt pkts[1024];
+	struct ring_pkt pkts[1024] __aligned(64);
 };
 
 static inline void ring_init(struct ring *r)

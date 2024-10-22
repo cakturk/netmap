@@ -37,6 +37,11 @@
 #define tcp_hdr(p) (struct tcphdr *)((unsigned char *)p)
 #define udp_hdr(p) (struct udphdr *)((unsigned char *)p)
 
+#define DV(_fmt, ...) do {			\
+	if (verbose > 1)			\
+		D(_fmt, ##__VA_ARGS__);		\
+} while (0)
+
 #define __unused __attribute__((__unused__))
 
 #define wait_event(expr, m, cond) do {		\
@@ -503,8 +508,8 @@ mq_rings_move(struct netmap_ring *rxring, struct netmap_ring *txring,
 			    msg, rs->len, j, k);
 			rs->len = 0;
 		} else if (verbose > 1) {
-			D("%s: fwd len %u, rx[%d] -> tx[%d]",
-			    msg, rs->len, j, k);
+			DV("%s: fwd len %u, rx[%d] -> tx[%d]",
+			   msg, rs->len, j, k);
 		}
 		ts->len = rs->len;
 		if (zerocopy) {
@@ -533,7 +538,7 @@ mq_rings_move(struct netmap_ring *rxring, struct netmap_ring *txring,
 	rxring->head = rxring->cur = j;
 	txring->head = txring->cur = k;
 	if (verbose && m > 0)
-		D("%s fwd %d packets: rxring %u --> txring %u",
+		DV("%s fwd %d packets: rxring %u --> txring %u",
 		    msg, m, rxring->ringid, txring->ringid);
 
 	return (m);
@@ -619,7 +624,7 @@ again:
 	ret = poll(pollfd, 2, 2500);
 #endif /* !defined(BUSYWAIT) */
 	if (ret <= 0)
-		D("poll %s [0] ev %x %x rx %d@%d tx %d,"
+		DV("poll %s [0] ev %x %x rx %d@%d tx %d,"
 		  " [1] ev %x %x rx %d@%d tx %d",
 		  ret <= 0 ? "timeout" : "ok",
 		  pollfd[0].events,
@@ -690,6 +695,8 @@ static void producer_proc(void *shdata, const char *ifa, const char *ifb,
 
 	if (nr_rings > NR_MAX_QUEUES)
 		die("update NR_MAX_QUEUES value");
+
+	printf("network interface %s has %d queue(s)\n", ifa, nr_rings);
 
 	for (i = 0; i < nr_rings; i++, ppa++, ppb++) {
 		struct thread_args targs;

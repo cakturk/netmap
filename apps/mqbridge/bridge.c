@@ -150,6 +150,7 @@ static int verbose = 0;
 
 static int do_abort = 0;
 static int zerocopy = 1; /* enable zerocopy if possible */
+static int mproc = 0; /* enable multi process */
 
 static void
 sigint_h(int sig)
@@ -1318,7 +1319,7 @@ main(int argc, char **argv)
 	int ch;
 	void *shmem;
 
-	while ((ch = getopt(argc, argv, "hb:ci:vw:L")) != -1) {
+	while ((ch = getopt(argc, argv, "hb:ci:mvw:L")) != -1) {
 		switch (ch) {
 		default:
 			D("bad option %c %s", ch, optarg);
@@ -1340,6 +1341,9 @@ main(int argc, char **argv)
 			break;
 		case 'c':
 			zerocopy = 0; /* do not zerocopy */
+			break;
+		case 'm':
+			mproc = 1; /* multi-process */
 			break;
 		case 'v':
 			verbose++;

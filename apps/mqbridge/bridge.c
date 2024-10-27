@@ -692,6 +692,114 @@ again:
 		goto again;
 }
 
+static void mq_proc_bridge_pkts(struct pkt_port *ppa, struct pkt_port *ppb)
+{
+	char msg_a2b[256], msg_b2a[256];
+	int pa_sw_rings, pb_sw_rings;
+	struct nmport_d *pa, *pb;
+	struct pollfd pollfd[2];
+	u_int burst = 1024;
+	int n0, n1, ret;
+
+	pa = ppa->pi_nmp;
+	pb = ppb->pi_nmp;
+
+	pa_sw_rings = (pa->reg.nr_mode == NR_REG_SW ||
+	    pa->reg.nr_mode == NR_REG_ONE_SW);
+	pb_sw_rings = (pb->reg.nr_mode == NR_REG_SW ||
+	    pb->reg.nr_mode == NR_REG_ONE_SW);
+
+	snprintf(msg_a2b, sizeof(msg_a2b), "%s:%s --> %s:%s",
+			pa->hdr.nr_name, pa_sw_rings ? "host" : "nic",
+			pb->hdr.nr_name, pb_sw_rings ? "host" : "nic");
+
+	snprintf(msg_b2a, sizeof(msg_b2a), "%s:%s --> %s:%s",
+			pb->hdr.nr_name, pb_sw_rings ? "host" : "nic",
+			pa->hdr.nr_name, pa_sw_rings ? "host" : "nic");
+
+	memset(pollfd, 0, sizeof(pollfd));
+	pollfd[0].fd = pa->fd;
+	pollfd[1].fd = pb->fd;
+
+again:
+	pollfd[0].events = pollfd[1].events = 0;
+	pollfd[0].revents = pollfd[1].revents = 0;
+	n0 = rx_slots_avail(pa);
+	n1 = rx_slots_avail(pb);
+#ifdef BUSYWAIT
+	if (n0) {
+		pollfd[1].revents = POLLOUT;
+	} else {
+		ioctl(pollfd[0].fd, NIOCRXSYNC, NULL);
+	}
+	if (n1) {
+		pollfd[0].revents = POLLOUT;
+	} else {
+		ioctl(pollfd[1].fd, NIOCRXSYNC, NULL);
+	}
+	ret = 1;
+#else  /* !defined(BUSYWAIT) */
+	if (n0)
+		/* pollfd[1].events |= POLLOUT; */;
+	else
+		pollfd[0].events |= POLLIN;
+	if (n1)
+		/* pollfd[0].events |= POLLOUT; */;
+	else
+		pollfd[1].events |= POLLIN;
+
+	/* poll() also cause kernel to txsync/rxsync the NICs */
+	ret = poll(pollfd, 2, 2500);
+#endif /* !defined(BUSYWAIT) */
+	if (ret <= 0)
+		DV("poll %s [0] ev %x %x rx %d@%d tx %d,"
+		  " [1] ev %x %x rx %d@%d tx %d",
+		  ret <= 0 ? "timeout" : "ok",
+		  pollfd[0].events,
+		  pollfd[0].revents,
+		  rx_slots_avail(pa),
+		  NETMAP_RXRING(pa->nifp, pa->cur_rx_ring)->head,
+		  tx_slots_avail(pa),
+		  pollfd[1].events,
+		  pollfd[1].revents,
+		  rx_slots_avail(pb),
+		  NETMAP_RXRING(pb->nifp, pb->cur_rx_ring)->head,
+		  tx_slots_avail(pb)
+		 );
+	if (ret < 0)
+		return;
+	if (pollfd[0].revents & POLLERR) {
+		struct netmap_ring *rx = NETMAP_RXRING(pa->nifp, pa->cur_rx_ring);
+		D("error on fd0, rx [%d,%d,%d)",
+		  rx->head, rx->cur, rx->tail);
+	}
+	if (pollfd[1].revents & POLLERR) {
+		struct netmap_ring *rx = NETMAP_RXRING(pb->nifp, pb->cur_rx_ring);
+		D("error on fd1, rx [%d,%d,%d)",
+		  rx->head, rx->cur, rx->tail);
+	}
+	if (pollfd[0].revents & POLLOUT) {
+		mq_ports_move(pb, pa, burst, msg_b2a);
+#ifdef BUSYWAIT
+		ioctl(pollfd[0].fd, NIOCTXSYNC, NULL);
+#endif
+	}
+
+	if (pollfd[1].revents & POLLOUT) {
+		mq_ports_move(pa, pb, burst, msg_a2b);
+#ifdef BUSYWAIT
+		ioctl(pollfd[1].fd, NIOCTXSYNC, NULL);
+#endif
+	}
+
+	/*
+	 * We don't need ioctl(NIOCTXSYNC) on the two file descriptors.
+	 * here. The kernel will txsync on next poll().
+	 */
+	if (unlikely(!do_abort))
+		goto again;
+}
+
 static void *mq_bridge_pkts_thread(void *arg)
 {
 	struct thread_args *args = arg;
@@ -757,6 +865,12 @@ static void producer_proc(void *shdata, const char *ifa, const char *ifb,
 		if (pthread_create(&threads[i], NULL, mq_bridge_pkts_thread, &targs))
 			die("failed to create producer netmap thread\n");
 	}
+
+	/* signal(SIGINT, sigint_h); */
+	/* create_producer_receivers(shdata); */
+	set_event_broadcast(shm->s_notifier.rn_ready = 1,
+			    &shm->s_notifier.rn_ready_mtx,
+			    &shm->s_notifier.rn_ready_cond);
 
 	for (i = 0; i < nr_rings; i++) {
 		pthread_join(threads[i], NULL);

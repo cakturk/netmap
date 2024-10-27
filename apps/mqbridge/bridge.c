@@ -16,6 +16,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/poll.h>
@@ -31,6 +32,11 @@
 #include <netinet/udp.h>
 #include "uinet_queue.h"
 #include "ring.h"
+
+#ifndef likely
+#define likely(x)       __builtin_expect(!!(x), 1)
+#define unlikely(x)     __builtin_expect(!!(x), 0)
+#endif /* likely and unlikely */
 
 #define eth_hdr(p) (struct ether_header *)((unsigned char *)p)
 #define ip_hdr(p) (struct ip *)((unsigned char *)p)
@@ -258,7 +264,13 @@ struct pkt_port {
 	struct nmport_d *pi_nmp;
 	struct pkt_ring pi_tx;
 	struct pkt_ring pi_rx;
+	int pi_efd;
 };
+
+static inline int pkt_port_tx_queued(const struct pkt_port *d)
+{
+	return ring_len(&d->pi_tx.p_ring);
+}
 
 /*
  * shm_struct type represents netmap hardware and software interfaces.
@@ -320,6 +332,8 @@ pkt_ring_wait(struct pkt_ring *pr)
 
 static void pkt_port_init(struct pkt_port *p, struct nmport_d *nmp)
 {
+	int efd;
+
 	p->pi_nmp = nmp;
 	printf("%s: nmp fd: %d\n", __func__, nmp->fd);
 	p->pi_rx.p_nmring = NETMAP_RXRING(nmp->nifp, nmp->first_rx_ring);
@@ -333,6 +347,11 @@ static void pkt_port_init(struct pkt_port *p, struct nmport_d *nmp)
 
 	pkt_ring_init(&p->pi_rx, 1, nmp->first_rx_ring);
 	pkt_ring_init(&p->pi_tx, 0, nmp->first_tx_ring);
+
+	efd = eventfd(0, EFD_NONBLOCK);
+	if (efd < 0)
+		die("unable to create eventfd: %s\n", strerror(errno));
+	p->pi_efd = efd;
 
 	printf("%s init rx %p tx %p\n", nmp->hdr.nr_name, p->pi_rx.p_nmring, p->pi_tx.p_nmring);
 }
@@ -669,7 +688,8 @@ again:
 	 * We don't need ioctl(NIOCTXSYNC) on the two file descriptors.
 	 * here. The kernel will txsync on next poll().
 	 */
-	goto again;
+	if (unlikely(!do_abort))
+		goto again;
 }
 
 static void *mq_bridge_pkts_thread(void *arg)
@@ -1034,9 +1054,6 @@ static void *consumer_proc_rxsw(void *shdata)
 
 static void consumer_proc(void *shdata)
 {
-	struct pkt_port *ipr = shdata;
-	struct ring __unused *r = &ipr->pi_rx.p_ring;
-	struct ring __unused *x = &ipr->pi_tx.p_ring;
 	pthread_t thhw, thsw;
 	int ret;
 

@@ -71,7 +71,7 @@
 	__set_event(expr, m, cond, pthread_cond_broadcast)
 
 struct ifpair;
-struct pkt_port;
+struct consumer_port;
 struct shm_struct;
 
 static void prepare_poll(struct ifpair *ifp);
@@ -260,17 +260,27 @@ struct pkt_ring {
  * data required for packets coming from (rx) and going to (tx) the
  * network adapter.
  */
-struct pkt_port {
-	struct nmport_d *pi_nmp;
-	struct pkt_ring pi_tx;
-	struct pkt_ring pi_rx;
+struct consumer_port {
+	struct nmport_d *cp_nmp;
+	struct pkt_ring cp_tx;
+	struct pkt_ring cp_rx;
 	int pi_efd;
 };
 
-static inline int pkt_port_tx_queued(const struct pkt_port *d)
+static inline int consumer_port_tx_queued(const struct consumer_port *d)
 {
-	return ring_len(&d->pi_tx.p_ring);
+	return ring_len(&d->cp_tx.p_ring);
 }
+
+struct consumer_task {
+	struct consumer_port c_pa;
+	struct consumer_port c_pb;
+};
+
+struct producer_task {
+	struct nmport_d *p_nmp;
+	int p_efd;
+};
 
 /*
  * shm_struct type represents netmap hardware and software interfaces.
@@ -282,10 +292,11 @@ struct shm_struct {
 		int rn_ready;
 	} s_notifier;
 
-	struct pkt_port *s_pa;
-	struct pkt_port *s_pb;
+	struct consumer_task s_tasks;
+	struct consumer_port *s_pa;
+	struct consumer_port *s_pb;
 
-	struct pkt_port s_ports[];
+	struct consumer_port s_ports[];
 };
 
 static void
@@ -330,14 +341,14 @@ pkt_ring_wait(struct pkt_ring *pr)
 	pthread_mutex_unlock(&pr->p_mtx);
 }
 
-static void pkt_port_init(struct pkt_port *p, struct nmport_d *nmp)
+static void pkt_port_init(struct consumer_port *p, struct nmport_d *nmp)
 {
 	int efd;
 
-	p->pi_nmp = nmp;
+	p->cp_nmp = nmp;
 	printf("%s: nmp fd: %d\n", __func__, nmp->fd);
-	p->pi_rx.p_nmring = NETMAP_RXRING(nmp->nifp, nmp->first_rx_ring);
-	p->pi_tx.p_nmring = NETMAP_TXRING(nmp->nifp, nmp->first_tx_ring);
+	p->cp_rx.p_nmring = NETMAP_RXRING(nmp->nifp, nmp->first_rx_ring);
+	p->cp_tx.p_nmring = NETMAP_TXRING(nmp->nifp, nmp->first_tx_ring);
 
 	printf("first rx %u-%u first tx %u-%u num rx/tx: %u/%u num host rx/tx: %u/%u\n",
 	       nmp->first_rx_ring, nmp->last_rx_ring,
@@ -345,36 +356,36 @@ static void pkt_port_init(struct pkt_port *p, struct nmport_d *nmp)
 	       nmp->nifp->ni_rx_rings, nmp->nifp->ni_tx_rings,
 	       nmp->nifp->ni_host_rx_rings, nmp->nifp->ni_host_tx_rings);
 
-	pkt_ring_init(&p->pi_rx, 1, nmp->first_rx_ring);
-	pkt_ring_init(&p->pi_tx, 0, nmp->first_tx_ring);
+	pkt_ring_init(&p->cp_rx, 1, nmp->first_rx_ring);
+	pkt_ring_init(&p->cp_tx, 0, nmp->first_tx_ring);
 
 	efd = eventfd(0, EFD_NONBLOCK);
 	if (efd < 0)
 		die("unable to create eventfd: %s\n", strerror(errno));
 	p->pi_efd = efd;
 
-	printf("%s init rx %p tx %p\n", nmp->hdr.nr_name, p->pi_rx.p_nmring, p->pi_tx.p_nmring);
+	printf("%s init rx %p tx %p\n", nmp->hdr.nr_name, p->cp_rx.p_nmring, p->cp_tx.p_nmring);
 }
 
-static struct pkt_port *rxport(struct shm_struct *shm,
+static struct consumer_port *rxport(struct shm_struct *shm,
 			       struct netmap_ring *rxring)
 {
-	if (shm->s_pa->pi_rx.p_nmring == rxring)
+	if (shm->s_pa->cp_rx.p_nmring == rxring)
 		return shm->s_pa;
 
-	if (shm->s_pb->pi_rx.p_nmring == rxring)
+	if (shm->s_pb->cp_rx.p_nmring == rxring)
 		return shm->s_pb;
 
 	panic("rxport: invalid port\n");
 }
 
-static struct pkt_port *txport(struct shm_struct *shm,
+static struct consumer_port *txport(struct shm_struct *shm,
 			       struct netmap_ring *txring)
 {
-	if (shm->s_pa->pi_tx.p_nmring == txring)
+	if (shm->s_pa->cp_tx.p_nmring == txring)
 		return shm->s_pa;
 
-	if (shm->s_pb->pi_tx.p_nmring == txring)
+	if (shm->s_pb->cp_tx.p_nmring == txring)
 		return shm->s_pb;
 
 	panic("txport: invalid port\n");
@@ -433,32 +444,32 @@ static void __unused parent_proc(void *shdata)
 {
 	char buf[1500];
 	int got;
-	struct pkt_port *ipr = shdata;
-	struct ring *r = &ipr->pi_rx.p_ring;
+	struct consumer_port *ipr = shdata;
+	struct ring *r = &ipr->cp_rx.p_ring;
 
 	printf("parent running %d\n", getpid());
-	printf("ring len: tx %lu rx %lu\n", ring_len(&ipr->pi_rx.p_ring), ring_len(&ipr->pi_tx.p_ring));
+	printf("ring len: tx %lu rx %lu\n", ring_len(&ipr->cp_rx.p_ring), ring_len(&ipr->cp_tx.p_ring));
 
-	pthread_mutex_lock(&ipr->pi_rx.p_mtx);
-	while (ring_len(&ipr->pi_rx.p_ring) <= 0) {
-		pthread_cond_wait(&ipr->pi_rx.p_wake, &ipr->pi_rx.p_mtx);
+	pthread_mutex_lock(&ipr->cp_rx.p_mtx);
+	while (ring_len(&ipr->cp_rx.p_ring) <= 0) {
+		pthread_cond_wait(&ipr->cp_rx.p_wake, &ipr->cp_rx.p_mtx);
 	}
-	pthread_mutex_unlock(&ipr->pi_rx.p_mtx);
+	pthread_mutex_unlock(&ipr->cp_rx.p_mtx);
 	got = ring_get(r, buf, 16);
 	printf("parent: parent woken up got %d '%.*s'\n", got, 17, buf);
 }
 
 static void __unused child_proc(void *shdata)
 {
-	struct pkt_port *ipr = shdata;
-	struct ring *r = &ipr->pi_rx.p_ring;
+	struct consumer_port *ipr = shdata;
+	struct ring *r = &ipr->cp_rx.p_ring;
 
 	ring_put(r, "this is message", 16);
 	/* strcpy(p, "this is message"); */
 	printf("child: wake parent\n");
-	pthread_mutex_lock(&ipr->pi_rx.p_mtx);
-	pthread_cond_signal(&ipr->pi_rx.p_wake);
-	pthread_mutex_unlock(&ipr->pi_rx.p_mtx);
+	pthread_mutex_lock(&ipr->cp_rx.p_mtx);
+	pthread_cond_signal(&ipr->cp_rx.p_wake);
+	pthread_mutex_unlock(&ipr->cp_rx.p_mtx);
 }
 
 static int get_ring_count(const char *ifname)
@@ -692,7 +703,7 @@ again:
 		goto again;
 }
 
-static void mq_proc_bridge_pkts(struct pkt_port *ppa, struct pkt_port *ppb)
+static void mq_proc_bridge_pkts(struct consumer_port *ppa, struct consumer_port *ppb)
 {
 	char msg_a2b[256], msg_b2a[256];
 	int pa_sw_rings, pb_sw_rings;
@@ -701,8 +712,8 @@ static void mq_proc_bridge_pkts(struct pkt_port *ppa, struct pkt_port *ppb)
 	u_int burst = 1024;
 	int n0, n1, ret;
 
-	pa = ppa->pi_nmp;
-	pb = ppb->pi_nmp;
+	pa = ppa->cp_nmp;
+	pb = ppb->cp_nmp;
 
 	pa_sw_rings = (pa->reg.nr_mode == NR_REG_SW ||
 	    pa->reg.nr_mode == NR_REG_ONE_SW);
@@ -819,7 +830,7 @@ static void producer_proc(void *shdata, const char *ifa, const char *ifb,
 	struct nmport_d *pa = NULL, *pb = NULL;
 	int pa_sw_rings, pb_sw_rings;
 	int i, nifps = 0;
-	struct pkt_port *ppa = shm->s_pa, *ppb = shm->s_pb;
+	struct consumer_port *ppa = shm->s_pa, *ppb = shm->s_pb;
 	pthread_t threads[NR_MAX_QUEUES];
 
 	if (nr_rings > NR_MAX_QUEUES)
@@ -1039,7 +1050,7 @@ static void print_pkt(const char *prefix, char *rxbuf, const char *msg,
 static void *producer_receive_soft(void *shdata)
 {
 	struct shm_struct *shm = shdata;
-	struct pkt_port *pb = shm->s_pb;
+	struct consumer_port *pb = shm->s_pb;
 	struct netmap_ring *sw_txring;
 	struct netmap_slot *ts;
 	unsigned int len;
@@ -1047,16 +1058,16 @@ static void *producer_receive_soft(void *shdata)
 	char *txbuf;
 	u_int k;
 
-	sw_txring = pb->pi_tx.p_nmring;
+	sw_txring = pb->cp_tx.p_nmring;
 	for (;;) {
 		int ret = 0;
 		/* printf("producer receive sw pb::tx %p\n", &pb->pi_tx); */
-		pkt_ring_wait(&pb->pi_tx);
+		pkt_ring_wait(&pb->cp_tx);
 
 		k = sw_txring->head;
 		ts = &sw_txring->slot[k];
 		txbuf = NETMAP_BUF(sw_txring, ts->buf_idx);
-		len = ring_get(&pb->pi_tx.p_ring, buf, sizeof(buf));
+		len = ring_get(&pb->cp_tx.p_ring, buf, sizeof(buf));
 		if (len > 0) {
 			ts->len = len;
 			nm_pkt_copy(buf, txbuf, len);
@@ -1065,7 +1076,7 @@ static void *producer_receive_soft(void *shdata)
 			/* ret = ioctl(pb->pi_nmp->fd, NIOCRXSYNC, NULL); */
 			printf("producer receive sw woken with pkt len %u empty: %d space %d fd: %d ret %d\n",
 			       len, nm_ring_empty(sw_txring), nm_ring_space(sw_txring),
-			       pb->pi_nmp->fd, ret);
+			       pb->cp_nmp->fd, ret);
 		}
 	}
 	return NULL;
@@ -1074,7 +1085,7 @@ static void *producer_receive_soft(void *shdata)
 static void *producer_receive_hard(void *shdata)
 {
 	struct shm_struct *shm = shdata;
-	struct pkt_port *pa = shm->s_pa;
+	struct consumer_port *pa = shm->s_pa;
 	struct netmap_ring *hw_txring;
 	struct netmap_slot *ts;
 	unsigned int len;
@@ -1082,16 +1093,16 @@ static void *producer_receive_hard(void *shdata)
 	char *txbuf;
 	u_int k;
 
-	hw_txring = pa->pi_tx.p_nmring;
+	hw_txring = pa->cp_tx.p_nmring;
 	for (;;) {
 		int ret = 0;
 		/* printf("producer receive hw pa::tx %p\n", &pa->pi_tx); */
-		pkt_ring_wait(&pa->pi_tx);
+		pkt_ring_wait(&pa->cp_tx);
 
 		k = hw_txring->head;
 		ts = &hw_txring->slot[k];
 		txbuf = NETMAP_BUF(hw_txring, ts->buf_idx);
-		len = ring_get(&pa->pi_tx.p_ring, buf, sizeof(buf));
+		len = ring_get(&pa->cp_tx.p_ring, buf, sizeof(buf));
 		if (len > 0) {
 			ts->len = len;
 			nm_pkt_copy(buf, txbuf, len);
@@ -1100,7 +1111,7 @@ static void *producer_receive_hard(void *shdata)
 			/* ret = ioctl(pa->pi_nmp->fd, NIOCRXSYNC, NULL); */
 			printf("producer receive hw woken with pkt len %u empty: %d space %d fd: %d ret %d\n",
 			       len, nm_ring_empty(hw_txring), nm_ring_space(hw_txring),
-			       pa->pi_nmp->fd, ret);
+			       pa->cp_nmp->fd, ret);
 		}
 	}
 	return NULL;
@@ -1122,23 +1133,23 @@ static void create_producer_receivers(void *shmem)
 static void *consumer_proc_rxhw(void *shdata)
 {
 	struct shm_struct *shm = shdata;
-	struct pkt_port *pa = shm->s_pa;
-	struct pkt_port *pb = shm->s_pb;
+	struct consumer_port *pa = shm->s_pa;
+	struct consumer_port *pb = shm->s_pb;
 	unsigned int len;
 	char buf[2048];
 
 	for (;;) {
 		printf("rxhw waiting for pkt\n");
-		pkt_ring_wait(&pa->pi_rx);
-		len = ring_get(&pa->pi_rx.p_ring, buf, sizeof(buf));
+		pkt_ring_wait(&pa->cp_rx);
+		len = ring_get(&pa->cp_rx.p_ring, buf, sizeof(buf));
 		printf("%s %u pid: %ld\n", __func__, len, (long)getpid());
 		if (len <= 0)
 			continue;
-		len = ring_put(&pb->pi_tx.p_ring, buf, len);
-		pkt_ring_wake(&pb->pi_tx);
+		len = ring_put(&pb->cp_tx.p_ring, buf, len);
+		pkt_ring_wake(&pb->cp_tx);
 		printf("put %s %u unused %lu pb::tx %p\n",
 		       __func__, len,
-		       ring_unused(&pb->pi_rx.p_ring), &pb->pi_tx);
+		       ring_unused(&pb->cp_rx.p_ring), &pb->cp_tx);
 	}
 	return NULL;
 }
@@ -1146,22 +1157,22 @@ static void *consumer_proc_rxhw(void *shdata)
 static void *consumer_proc_rxsw(void *shdata)
 {
 	struct shm_struct *shm = shdata;
-	struct pkt_port *pa = shm->s_pa;
-	struct pkt_port *pb = shm->s_pb;
+	struct consumer_port *pa = shm->s_pa;
+	struct consumer_port *pb = shm->s_pb;
 	unsigned int len;
 	char buf[2048];
 
 	for (;;) {
 		printf("rxsw waiting for pkt\n");
-		pkt_ring_wait(&pb->pi_rx);
-		len = ring_get(&pb->pi_rx.p_ring, buf, sizeof(buf));
+		pkt_ring_wait(&pb->cp_rx);
+		len = ring_get(&pb->cp_rx.p_ring, buf, sizeof(buf));
 		printf("%s %u pid: %ld\n", __func__, len, (long)getpid());
 		if (len <= 0)
 			continue;
-		len = ring_put(&pa->pi_tx.p_ring, buf, len);
+		len = ring_put(&pa->cp_tx.p_ring, buf, len);
 		printf("put %s %u unused %lu pb::tx %p\n", __func__, len,
-		       ring_unused(&pa->pi_rx.p_ring), &pb->pi_tx);
-		pkt_ring_wake(&pa->pi_tx);
+		       ring_unused(&pa->cp_rx.p_ring), &pb->cp_tx);
+		pkt_ring_wake(&pa->cp_tx);
 	}
 	return NULL;
 }
@@ -1242,15 +1253,15 @@ rings_move(struct netmap_ring *rxring, struct netmap_ring *txring,
 			char *rxbuf = NETMAP_BUF(rxring, rs->buf_idx);
 			struct ring *r;
 			struct ring __unused *x;
-			struct pkt_port *rxp, *txp;
+			struct consumer_port *rxp, *txp;
 
 			rxp = rxport(shm, rxring);
 			txp = txport(shm, txring);
-			r = &rxp->pi_rx.p_ring;
-			x = &txp->pi_tx.p_ring;
+			r = &rxp->cp_rx.p_ring;
+			x = &txp->cp_tx.p_ring;
 			ring_put(r, rxbuf, ts->len);
 			print_pkt(NULL, rxbuf, msg, rxring->ringid, txring->ringid, ts->len);
-			pkt_ring_wake(&rxp->pi_rx);
+			pkt_ring_wake(&rxp->cp_rx);
 			/* nm_pkt_copy(p, txbuf, ts->len); */
 			/* nm_pkt_copy(rxbuf, txbuf, ts->len); */
 		}

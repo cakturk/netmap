@@ -1,0 +1,61 @@
+- Multi process version of some functions -
+
+-- Main process --
+
+mq_bridge_pkts:
+    - POLLIN:	netmap_ring {hw, host}, always on
+        ports_move_to_subprocess
+    - POLLOUT:	if there are packets enqueued by the subprocess in
+      pkt_ring. Notified by an eventfd.
+        ports_move_from_subprocess
+
+mq_ports_move:
+    - s/nm_ring_empty/!ring_full
+
+mq_rings_move:
+    - ring_put -> pkt_ring_wake
+
+
+producer_receive_{soft, hard}: Take the packet back from the subprocess.
+This thread is notified by the subprocess by calling the pthread_signal
+call its corresponding condition variable.
+
+    - pkt_ring_wait on tx -> ring_get -> put netmap slot -> notify
+      netmap possibly with eventfd -> POLLOUT
+
+
+
+-- Subprocesses --
+
+consumer_proc_rx{hw, sw}:
+    - pkt_ring_wait on rx -> ring_get -> process -> ptr_ring_wake on tx
+        to wake the main (consumer) process and then the main process
+        notifies its event loop by using the eventfd mechanism.
+
+
+-- Summary --
+
+hw_port and host_port:
+----------------------
+
+(parent process)
+- rx pkt from netmap_ring
+- move it to to the subprocess rx ring
+- wake up subprocess
+(subprocess)
+- process pkt (switched to the subprocess)
+- move to subprocess tx
+- wake up (notify) main process
+(parent process)
+- (switched to main proc) notify main thread by writing to the event fd
+- recv pkts from subprocess tx ring
+- place pkts in the corresponding netmap_ring
+
+Basic illustration
+------------------
+
+Main process
+rx tx | (hw/sw) -> ------------ <-- subprocess
+
+Subprocess
+rx tx | (hw/sw) -> ------------ <-- main process

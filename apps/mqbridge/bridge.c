@@ -261,10 +261,9 @@ struct pkt_ring {
  * network adapter.
  */
 struct consumer_port {
-	struct nmport_d *cp_nmp;
 	struct pkt_ring cp_tx;
 	struct pkt_ring cp_rx;
-	int pi_efd;
+	int cp_efd;
 };
 
 static inline int consumer_port_tx_queued(const struct consumer_port *d)
@@ -292,11 +291,7 @@ struct shm_struct {
 		int rn_ready;
 	} s_notifier;
 
-	struct consumer_task s_tasks;
-	struct consumer_port *s_pa;
-	struct consumer_port *s_pb;
-
-	struct consumer_port s_ports[];
+	struct consumer_task s_tasks[];
 };
 
 static void
@@ -345,7 +340,6 @@ static void pkt_port_init(struct consumer_port *p, struct nmport_d *nmp)
 {
 	int efd;
 
-	p->cp_nmp = nmp;
 	printf("%s: nmp fd: %d\n", __func__, nmp->fd);
 	p->cp_rx.p_nmring = NETMAP_RXRING(nmp->nifp, nmp->first_rx_ring);
 	p->cp_tx.p_nmring = NETMAP_TXRING(nmp->nifp, nmp->first_tx_ring);
@@ -362,7 +356,7 @@ static void pkt_port_init(struct consumer_port *p, struct nmport_d *nmp)
 	efd = eventfd(0, EFD_NONBLOCK);
 	if (efd < 0)
 		die("unable to create eventfd: %s\n", strerror(errno));
-	p->pi_efd = efd;
+	p->cp_efd = efd;
 
 	printf("%s init rx %p tx %p\n", nmp->hdr.nr_name, p->cp_rx.p_nmring, p->cp_tx.p_nmring);
 }
@@ -370,24 +364,12 @@ static void pkt_port_init(struct consumer_port *p, struct nmport_d *nmp)
 static struct consumer_port *rxport(struct shm_struct *shm,
 			       struct netmap_ring *rxring)
 {
-	if (shm->s_pa->cp_rx.p_nmring == rxring)
-		return shm->s_pa;
-
-	if (shm->s_pb->cp_rx.p_nmring == rxring)
-		return shm->s_pb;
-
 	panic("rxport: invalid port\n");
 }
 
 static struct consumer_port *txport(struct shm_struct *shm,
 			       struct netmap_ring *txring)
 {
-	if (shm->s_pa->cp_tx.p_nmring == txring)
-		return shm->s_pa;
-
-	if (shm->s_pb->cp_tx.p_nmring == txring)
-		return shm->s_pb;
-
 	panic("txport: invalid port\n");
 }
 
@@ -400,7 +382,7 @@ mem_init(int nr_rings)
 	size_t length;
 	int fd;
 
-	length = sizeof(*shm) + sizeof(*shm->s_pa) * nr_rings * 2;
+	length = sizeof(*shm) + sizeof(struct consumer_task) * nr_rings;
 
 	if ((fd = shm_open("/pkt_memory", O_CREAT | O_RDWR, 0666)) < 0) {
 		shm_unlink("/pkt_memory");
@@ -421,9 +403,6 @@ mem_init(int nr_rings)
 	pthread_condattr_init(&cond_attr);
 	pthread_condattr_setpshared(&cond_attr, PTHREAD_PROCESS_SHARED);
 	pthread_cond_init(&shm->s_notifier.rn_ready_cond, &cond_attr);
-
-	shm->s_pa = &shm->s_ports[0];
-	shm->s_pb = &shm->s_ports[nr_rings];
 
 	return shm;
 }
@@ -703,7 +682,7 @@ again:
 		goto again;
 }
 
-static void mq_proc_bridge_pkts(struct consumer_port *ppa, struct consumer_port *ppb)
+static void mq_proc_bridge_pkts(struct producer_task *prod, struct consumer_task *cons)
 {
 	char msg_a2b[256], msg_b2a[256];
 	int pa_sw_rings, pb_sw_rings;
@@ -712,8 +691,8 @@ static void mq_proc_bridge_pkts(struct consumer_port *ppa, struct consumer_port 
 	u_int burst = 1024;
 	int n0, n1, ret;
 
-	pa = ppa->cp_nmp;
-	pb = ppb->cp_nmp;
+	pa = NULL;
+	pb = NULL;
 
 	pa_sw_rings = (pa->reg.nr_mode == NR_REG_SW ||
 	    pa->reg.nr_mode == NR_REG_ONE_SW);
@@ -830,7 +809,7 @@ static void producer_proc(void *shdata, const char *ifa, const char *ifb,
 	struct nmport_d *pa = NULL, *pb = NULL;
 	int pa_sw_rings, pb_sw_rings;
 	int i, nifps = 0;
-	struct consumer_port *ppa = shm->s_pa, *ppb = shm->s_pb;
+	struct consumer_task *task = shm->s_tasks;
 	pthread_t threads[NR_MAX_QUEUES];
 
 	if (nr_rings > NR_MAX_QUEUES)
@@ -838,7 +817,7 @@ static void producer_proc(void *shdata, const char *ifa, const char *ifb,
 
 	printf("network interface %s has %d queue(s)\n", ifa, nr_rings);
 
-	for (i = 0; i < nr_rings; i++, ppa++, ppb++) {
+	for (i = 0; i < nr_rings; i++, task++) {
 		struct thread_args targs;
 		/*
 		 * TODO: It is currently assumed that the first port is always
@@ -855,7 +834,7 @@ static void producer_proc(void *shdata, const char *ifa, const char *ifb,
 		if (pa == NULL)
 			die("cannot open %s", buf);
 
-		pkt_port_init(ppa, pa);
+		pkt_port_init(&task->c_pa, pa);
 
 		if (nr_rings > 1)
 			snprintf(buf, sizeof(buf), "%s%d@conf:host-rings=%d",
@@ -868,7 +847,7 @@ static void producer_proc(void *shdata, const char *ifa, const char *ifb,
 		if (pb == NULL)
 			die("cannot open %s", buf);
 
-		pkt_port_init(ppb, pb);
+		pkt_port_init(&task->c_pb, pb);
 
 		targs.hw_port = pa;
 		targs.host_port = pb;
@@ -902,8 +881,8 @@ static void producer_proc(void *shdata, const char *ifa, const char *ifb,
 		exit(1);
 	}
 
-	pkt_port_init(shm->s_pa, pa);
-	pkt_port_init(shm->s_pb, pb);
+	pkt_port_init(&shm->s_tasks[0].c_pa, pa);
+	pkt_port_init(&shm->s_tasks[0].c_pb, pb);
 
 	zerocopy = zerocopy && (pa->mem == pb->mem);
 	D("------- zerocopy %ssupported", zerocopy ? "" : "NOT ");
@@ -1050,7 +1029,7 @@ static void print_pkt(const char *prefix, char *rxbuf, const char *msg,
 static void *producer_receive_soft(void *shdata)
 {
 	struct shm_struct *shm = shdata;
-	struct consumer_port *pb = shm->s_pb;
+	struct consumer_port *pb = &shm->s_tasks[0].c_pb;
 	struct netmap_ring *sw_txring;
 	struct netmap_slot *ts;
 	unsigned int len;
@@ -1076,7 +1055,7 @@ static void *producer_receive_soft(void *shdata)
 			/* ret = ioctl(pb->pi_nmp->fd, NIOCRXSYNC, NULL); */
 			printf("producer receive sw woken with pkt len %u empty: %d space %d fd: %d ret %d\n",
 			       len, nm_ring_empty(sw_txring), nm_ring_space(sw_txring),
-			       pb->cp_nmp->fd, ret);
+			       -1, ret);
 		}
 	}
 	return NULL;
@@ -1085,7 +1064,7 @@ static void *producer_receive_soft(void *shdata)
 static void *producer_receive_hard(void *shdata)
 {
 	struct shm_struct *shm = shdata;
-	struct consumer_port *pa = shm->s_pa;
+	struct consumer_port *pa = &shm->s_tasks[0].c_pa;
 	struct netmap_ring *hw_txring;
 	struct netmap_slot *ts;
 	unsigned int len;
@@ -1111,7 +1090,7 @@ static void *producer_receive_hard(void *shdata)
 			/* ret = ioctl(pa->pi_nmp->fd, NIOCRXSYNC, NULL); */
 			printf("producer receive hw woken with pkt len %u empty: %d space %d fd: %d ret %d\n",
 			       len, nm_ring_empty(hw_txring), nm_ring_space(hw_txring),
-			       pa->cp_nmp->fd, ret);
+			       -1, ret);
 		}
 	}
 	return NULL;
@@ -1133,8 +1112,8 @@ static void create_producer_receivers(void *shmem)
 static void *consumer_proc_rxhw(void *shdata)
 {
 	struct shm_struct *shm = shdata;
-	struct consumer_port *pa = shm->s_pa;
-	struct consumer_port *pb = shm->s_pb;
+	struct consumer_port *pa = &shm->s_tasks[0].c_pa;
+	struct consumer_port *pb = &shm->s_tasks[0].c_pb;
 	unsigned int len;
 	char buf[2048];
 
@@ -1157,8 +1136,8 @@ static void *consumer_proc_rxhw(void *shdata)
 static void *consumer_proc_rxsw(void *shdata)
 {
 	struct shm_struct *shm = shdata;
-	struct consumer_port *pa = shm->s_pa;
-	struct consumer_port *pb = shm->s_pb;
+	struct consumer_port *pa = &shm->s_tasks[0].c_pa;
+	struct consumer_port *pb = &shm->s_tasks[0].c_pb;
 	unsigned int len;
 	char buf[2048];
 

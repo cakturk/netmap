@@ -1,13 +1,3 @@
-/*
- * (C) 2011-2014 Luigi Rizzo, Matteo Landi
- *
- * BSD license
- *
- * A netmap application to bridge two network interfaces,
- * or one interface and the host stack.
- *
- * $FreeBSD$
- */
 #include <libnetmap.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -266,13 +256,29 @@ struct consumer_port {
 	int cp_efd;
 };
 
+/*
+ * Returns the number of packets that the subprocess intends to inject
+ * back to the relevant interface through the main process.
+ */
 static inline int consumer_port_tx_queued(const struct consumer_port *d)
 {
 	return ring_len(&d->cp_tx.p_ring);
 }
 
+static inline int consumer_port_rx_queued(const struct consumer_port *d)
+{
+	return ring_unused(&d->cp_rx.p_ring);
+}
+
 struct consumer_task {
+	/*
+	 * So-called host port
+	 */
 	struct consumer_port c_pa;
+
+	/*
+	 * So-called hardware port
+	 */
 	struct consumer_port c_pb;
 };
 
@@ -682,40 +688,39 @@ again:
 		goto again;
 }
 
-static void mq_proc_bridge_pkts(struct producer_task *prod, struct consumer_task *cons)
+static void mq_proc_bridge_pkts(struct producer_task *prod, struct consumer_port *cp)
 {
 	char msg_a2b[256], msg_b2a[256];
-	int pa_sw_rings, pb_sw_rings;
+	int pa_sw_rings;
 	struct nmport_d *pa, *pb;
 	struct pollfd pollfd[2];
 	u_int burst = 1024;
 	int n0, n1, ret;
 
-	pa = NULL;
+	pa = prod->p_nmp;
 	pb = NULL;
 
 	pa_sw_rings = (pa->reg.nr_mode == NR_REG_SW ||
 	    pa->reg.nr_mode == NR_REG_ONE_SW);
-	pb_sw_rings = (pb->reg.nr_mode == NR_REG_SW ||
-	    pb->reg.nr_mode == NR_REG_ONE_SW);
 
 	snprintf(msg_a2b, sizeof(msg_a2b), "%s:%s --> %s:%s",
 			pa->hdr.nr_name, pa_sw_rings ? "host" : "nic",
-			pb->hdr.nr_name, pb_sw_rings ? "host" : "nic");
+			"proc", pa_sw_rings ? "proc nic" : "proc host");
 
 	snprintf(msg_b2a, sizeof(msg_b2a), "%s:%s --> %s:%s",
-			pb->hdr.nr_name, pb_sw_rings ? "host" : "nic",
+			"proc", pa_sw_rings ? "proc nic" : "proc host",
 			pa->hdr.nr_name, pa_sw_rings ? "host" : "nic");
 
 	memset(pollfd, 0, sizeof(pollfd));
 	pollfd[0].fd = pa->fd;
-	pollfd[1].fd = pb->fd;
+	pollfd[1].fd = cp->cp_efd;
 
 again:
 	pollfd[0].events = pollfd[1].events = 0;
 	pollfd[0].revents = pollfd[1].revents = 0;
 	n0 = rx_slots_avail(pa);
 	n1 = rx_slots_avail(pb);
+	n1 = consumer_port_tx_queued(cp);
 #ifdef BUSYWAIT
 	if (n0) {
 		pollfd[1].revents = POLLOUT;

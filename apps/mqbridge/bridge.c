@@ -287,6 +287,18 @@ struct producer_task {
 	int p_efd;
 };
 
+static int producer_task_init(struct producer_task *tsk, struct nmport_d *nmp)
+{
+	tsk->p_nmp = nmp;
+	tsk->p_efd = eventfd(0, EFD_NONBLOCK);
+	return tsk->p_efd < 0 ? -1  : 0;
+}
+
+struct proc_thread_args {
+	struct producer_task *prod;
+	struct consumer_port *cp;
+};
+
 /*
  * shm_struct type represents netmap hardware and software interfaces.
  */
@@ -713,13 +725,14 @@ static void mq_proc_bridge_pkts(struct producer_task *prod, struct consumer_port
 
 	memset(pollfd, 0, sizeof(pollfd));
 	pollfd[0].fd = pa->fd;
+
+	/* queued packets by subprocess */
 	pollfd[1].fd = cp->cp_efd;
 
 again:
 	pollfd[0].events = pollfd[1].events = 0;
 	pollfd[0].revents = pollfd[1].revents = 0;
 	n0 = rx_slots_avail(pa);
-	n1 = rx_slots_avail(pb);
 	n1 = consumer_port_tx_queued(cp);
 #ifdef BUSYWAIT
 	if (n0) {
@@ -795,6 +808,14 @@ again:
 		goto again;
 }
 
+static void *mq_proc_bridge_pkts_thread(void *arg)
+{
+	struct proc_thread_args *args = arg;
+
+	mq_proc_bridge_pkts(args->prod, args->cp);
+	return NULL;
+}
+
 static void *mq_bridge_pkts_thread(void *arg)
 {
 	struct thread_args *args = arg;
@@ -803,9 +824,97 @@ static void *mq_bridge_pkts_thread(void *arg)
 	return NULL;
 }
 
+static void init_producer_tasks(struct producer_task *tska, struct producer_task *tskb,
+				struct nmport_d *nma, struct nmport_d *nmb,
+				struct consumer_task *consumer_tsk,
+				pthread_t *tha, pthread_t *thb)
+{
+	struct proc_thread_args args0, args1;
 
-static void producer_proc(void *shdata, const char *ifa, const char *ifb,
-			  int nr_rings)
+	args0.prod = tska;
+	args0.cp = &consumer_tsk->c_pa;
+	args1.prod = tskb;
+	args1.cp = &consumer_tsk->c_pb;
+
+	if (producer_task_init(tska, nma))
+		die("unable to init prod task(pa): %s\n", strerror(errno));
+
+	if (producer_task_init(tskb, nmb))
+		die("unable to init prod task(pb): %s\n", strerror(errno));
+
+	if (pthread_create(tha, NULL, mq_proc_bridge_pkts_thread, &args0))
+		die("failed to create producer(pa) netmap thread\n");
+
+	if (pthread_create(thb, NULL, mq_proc_bridge_pkts_thread, &args1))
+		die("failed to create producer(pb) netmap thread\n");
+}
+
+static void multiproc_producer(void *shdata, const char *ifa, const char *ifb,
+			       int nr_rings)
+{
+	struct shm_struct *shm = shdata;
+	struct producer_task *prod_task_pb = malloc(sizeof(*prod_task_pb));
+	struct producer_task *prod_task_pa = malloc(sizeof(*prod_task_pa));
+	struct consumer_task *consumer_task = shm->s_tasks;
+	struct nmport_d *pa = NULL, *pb = NULL;
+	pthread_t threads[NR_MAX_QUEUES*2];
+	char buf[256];
+	int i;
+
+	if (nr_rings > NR_MAX_QUEUES)
+		die("update NR_MAX_QUEUES value");
+
+	printf("network interface %s has %d queue(s)\n", ifa, nr_rings);
+
+	for (i = 0; i < nr_rings; i = i + 2, consumer_task++) {
+		/*
+		 * TODO: It is currently assumed that the first port is always
+		 * the hardware ring, but we need to address this.
+		 */
+		if (nr_rings > 1)
+			snprintf(buf, sizeof(buf), "%s-%d@conf:host-rings=%d",
+				 ifa, i, nr_rings);
+		else
+			strcpy(buf, ifa);
+		printf("pa '%s' i: %d\n", buf, i);
+
+		pa = nmport_open(buf);
+		if (pa == NULL)
+			die("cannot open %s", buf);
+
+		pkt_port_init(&consumer_task->c_pa, pa);
+
+		if (nr_rings > 1)
+			snprintf(buf, sizeof(buf), "%s%d@conf:host-rings=%d",
+				 ifb, i, nr_rings);
+		else
+			strcpy(buf, ifb);
+
+		pb = nmport_open(buf);
+		printf("pb '%s'\n", buf);
+		if (pb == NULL)
+			die("cannot open %s", buf);
+
+		pkt_port_init(&consumer_task->c_pb, pb);
+
+		init_producer_tasks(prod_task_pa, prod_task_pb, pa, pb, consumer_task,
+				    &threads[i], &threads[i+1]);
+	}
+
+	/* signal(SIGINT, sigint_h); */
+	/* create_producer_receivers(shdata); */
+	set_event_broadcast(shm->s_notifier.rn_ready = 1,
+			    &shm->s_notifier.rn_ready_mtx,
+			    &shm->s_notifier.rn_ready_cond);
+
+	for (i = 0; i < nr_rings * 2; i++) {
+		pthread_join(threads[i], NULL);
+	}
+	printf("pa %p pb %p\n", pa, pb);
+}
+
+static void threaded_producer(void *shdata, const char *ifa, const char *ifb,
+			      int nr_rings)
 {
 	char msg_a2b[256], msg_b2a[256], buf[256];
 	struct shm_struct *shm = shdata;
@@ -815,6 +924,8 @@ static void producer_proc(void *shdata, const char *ifa, const char *ifb,
 	int pa_sw_rings, pb_sw_rings;
 	int i, nifps = 0;
 	struct consumer_task *task = shm->s_tasks;
+	struct producer_task *prod_task_pa = malloc(sizeof(*prod_task_pa));
+	struct producer_task *prod_task_pb = malloc(sizeof(*prod_task_pb));
 	pthread_t threads[NR_MAX_QUEUES];
 
 	if (nr_rings > NR_MAX_QUEUES)
@@ -978,10 +1089,10 @@ struct producer_thread_args {
 	int nr_rings;
 };
 
-static void __unused *producer_thread(void *pargs)
+static void __unused *producer_thread_fn(void *pargs)
 {
 	struct producer_thread_args *args = pargs;
-	producer_proc(args->shdata, args->ifa, args->ifb, args->nr_rings);
+	threaded_producer(args->shdata, args->ifa, args->ifb, args->nr_rings);
 	return NULL;
 }
 
@@ -1533,13 +1644,13 @@ main(int argc, char **argv)
 			.ifb = ifb,
 			.nr_rings = nr_rings
 		};
-		ret = pthread_create(&th, NULL, producer_thread, &args);
+		ret = pthread_create(&th, NULL, producer_thread_fn, &args);
 		if (ret)
 			die("failed to create producer thread\n");
 	}
 #else
 	if (fork_or_die()) {
-		producer_proc(shmem, ifa, ifb, nr_rings);
+		threaded_producer(shmem, ifa, ifb, nr_rings);
 	}
 	else
 #endif

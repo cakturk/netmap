@@ -70,7 +70,7 @@ static void do_poll(struct ifpair *ifp, u_int burst,
 		    const char *msg_a2b,
 		    const char *msg_b2a);
 static void create_producer_receivers(void *shmem);
-static void print_pkt(const char *prefix, char *rxbuf, const char *msg,
+static void print_pkt(const char *prefix, const char *rxbuf, const char *msg,
 		      uint16_t rx_ring, uint16_t tx_ring, u_int len);
 
 struct poll_port {
@@ -265,7 +265,7 @@ static inline int consumer_port_tx_queued(const struct consumer_port *d)
 	return ring_len(&d->cp_tx.p_ring);
 }
 
-static inline int consumer_port_rx_queued(const struct consumer_port *d)
+static inline int consumer_port_rx_space(const struct consumer_port *d)
 {
 	return ring_unused(&d->cp_rx.p_ring);
 }
@@ -700,6 +700,95 @@ again:
 		goto again;
 }
 
+static int
+rings_move_to_subprocess(struct netmap_ring *rxring, struct pkt_ring *txring,
+			 u_int limit, const char *msg)
+{
+	u_int j, m = 0;
+
+	/* print a warning if any of the ring flags is set (e.g. NM_REINIT) */
+	if (rxring->flags)
+		D("%s rxflags %x",
+		    msg, rxring->flags);
+	j = rxring->head; /* RX */
+	m = nm_ring_space(rxring);
+	if (m < limit)
+		limit = m;
+	m = ring_unused(&txring->p_ring);
+	if (m < limit)
+		limit = m;
+	m = limit;
+	while (limit-- > 0) {
+		struct netmap_slot *rs = &rxring->slot[j];
+		const char *rxbuf;
+
+		if (rs->buf_idx < 2) {
+			RD(2, "wrong index rxr[%d] = %d  -> txr[%d] = %d",
+			    j, rs->buf_idx, -1, -1);
+			sleep(2);
+		}
+		/* Copy the packet length. */
+		if (rs->len > rxring->nr_buf_size) {
+			RD(2,  "%s: invalid len %u, rxr[%d] -> txr[%d]",
+			    msg, rs->len, j, -1);
+			rs->len = 0;
+		} else if (verbose > 1) {
+			DV("%s: fwd len %u, rx[%d] -> tx[%d]",
+			   msg, rs->len, j, -1);
+		}
+
+		rxbuf = NETMAP_BUF(rxring, rs->buf_idx);
+		/* nm_pkt_copy(rxbuf, txbuf, ts->len); */
+		ring_put(&txring->p_ring, rxbuf, rs->len);
+		print_pkt("mq", rxbuf, msg, rxring->ringid, rxring->ringid, rs->len);
+
+		/*
+		 * Copy the NS_MOREFRAG from rs to ts, leaving any
+		 * other flags unchanged.
+		 */
+		j = nm_ring_next(rxring, j);
+	}
+	rxring->head = rxring->cur = j;
+	if (verbose && m > 0)
+		DV("%s fwd %d packets: rxring %u --> txring %u",
+		    msg, m, rxring->ringid, -1);
+
+	return (m);
+}
+
+/* Move packets src process ring to destination port. */
+static int
+ports_move_from_subprocess(struct consumer_port *src, struct nmport_d *dst,
+			   u_int limit, const char *msg)
+{
+	return (0);
+}
+
+/* Move packets from source port to destination process ring. */
+static int
+ports_move_to_subprocess(struct nmport_d *src, struct consumer_port *dst,
+			 u_int limit, const char *msg)
+{
+	struct netmap_ring *rxring;
+	u_int m = 0, si = src->first_rx_ring;
+
+	while (si <= src->last_rx_ring) {
+		rxring = NETMAP_RXRING(src->nifp, si);
+		/* txring = NETMAP_TXRING(dst->nifp, di); */
+		if (nm_ring_empty(rxring)) {
+			si++;
+			continue;
+		}
+		/* if (nm_ring_empty(txring)) { */
+		/* 	di++; */
+		/* 	continue; */
+		/* } */
+		/* m += mq_rings_move(rxring, txring, limit, msg); */
+		m += rings_move_to_subprocess(rxring, &dst->cp_rx, limit, msg);
+	}
+	return (m);
+}
+
 static void mq_proc_bridge_pkts(struct producer_task *prod, struct consumer_port *cp)
 {
 	char msg_a2b[256], msg_b2a[256];
@@ -707,10 +796,10 @@ static void mq_proc_bridge_pkts(struct producer_task *prod, struct consumer_port
 	struct nmport_d *pa, *pb;
 	struct pollfd pollfd[2];
 	u_int burst = 1024;
-	int n0, n1, ret;
+	int n0, n1, ret, nfds;
 
 	pa = prod->p_nmp;
-	pb = NULL;
+	pb = prod->p_nmp;
 
 	pa_sw_rings = (pa->reg.nr_mode == NR_REG_SW ||
 	    pa->reg.nr_mode == NR_REG_ONE_SW);
@@ -724,42 +813,32 @@ static void mq_proc_bridge_pkts(struct producer_task *prod, struct consumer_port
 			pa->hdr.nr_name, pa_sw_rings ? "host" : "nic");
 
 	memset(pollfd, 0, sizeof(pollfd));
-	pollfd[0].fd = pa->fd;
-
 	/* queued packets by subprocess */
-	pollfd[1].fd = cp->cp_efd;
+	pollfd[0].fd = cp->cp_efd;
+	pollfd[1].fd = pa->fd;
 
 again:
+	/* right now we don't have POLLOUT support for subprocess rings */
 	pollfd[0].events = pollfd[1].events = 0;
 	pollfd[0].revents = pollfd[1].revents = 0;
-	n0 = rx_slots_avail(pa);
-	n1 = consumer_port_tx_queued(cp);
-#ifdef BUSYWAIT
-	if (n0) {
-		pollfd[1].revents = POLLOUT;
-	} else {
-		ioctl(pollfd[0].fd, NIOCRXSYNC, NULL);
-	}
-	if (n1) {
-		pollfd[0].revents = POLLOUT;
-	} else {
-		ioctl(pollfd[1].fd, NIOCRXSYNC, NULL);
-	}
-	ret = 1;
-#else  /* !defined(BUSYWAIT) */
+	n0 = consumer_port_tx_queued(cp);
+	n1 = rx_slots_avail(pa);
+
+	nfds = 1;
 	if (n0)
-		/* pollfd[1].events |= POLLOUT; */;
+		pollfd[1].events |= POLLOUT;
 	else
 		pollfd[0].events |= POLLIN;
-	if (n1)
-		/* pollfd[0].events |= POLLOUT; */;
-	else
+
+	if (n1 == 0) {
 		pollfd[1].events |= POLLIN;
+		nfds = 2;
+	}
 
 	/* poll() also cause kernel to txsync/rxsync the NICs */
-	ret = poll(pollfd, 2, 2500);
-	printf("n0 %d n1 %d ret %d\n", n0, n1, ret);
-#endif /* !defined(BUSYWAIT) */
+	ret = poll(pollfd, nfds, 2500);
+	printf("n0 %d n1 %d ret %d nfds %d\n", n0, n1, ret, nfds);
+
 	if (ret <= 0)
 		DV("poll %s [0] ev %x %x rx %d@%d tx %d,"
 		  " [1] ev %x %x rx %d@%d tx %d",
@@ -782,23 +861,17 @@ again:
 		D("error on fd0, rx [%d,%d,%d)",
 		  rx->head, rx->cur, rx->tail);
 	}
-	if (pollfd[1].revents & POLLERR) {
+	if (nfds == 2 && pollfd[1].revents & POLLERR) {
 		struct netmap_ring *rx = NETMAP_RXRING(pb->nifp, pb->cur_rx_ring);
 		D("error on fd1, rx [%d,%d,%d)",
 		  rx->head, rx->cur, rx->tail);
 	}
 	if (pollfd[0].revents & POLLOUT) {
-		mq_ports_move(pb, pa, burst, msg_b2a);
-#ifdef BUSYWAIT
-		ioctl(pollfd[0].fd, NIOCTXSYNC, NULL);
-#endif
+		ports_move_from_subprocess(cp, pa, burst, msg_b2a);
 	}
 
-	if (pollfd[1].revents & POLLOUT) {
-		mq_ports_move(pa, pb, burst, msg_a2b);
-#ifdef BUSYWAIT
-		ioctl(pollfd[1].fd, NIOCTXSYNC, NULL);
-#endif
+	if (n1 || pollfd[1].revents & POLLIN) {
+		ports_move_to_subprocess(pa, cp, burst, msg_a2b);
 	}
 
 	/*
@@ -837,7 +910,7 @@ static void init_producer_tasks(struct producer_task *tska, struct producer_task
 	args1.prod = tskb;
 	args1.cp = &consumer_tsk->c_pb;
 
-	printf("%s: %p -> %p\n", __func__, nma->nifp->ni_name, nmb->nifp->ni_name);
+	printf("%s: %s -> %s\n", __func__, nma->nifp->ni_name, nmb->nifp->ni_name);
 	printf("modes pa %d pb %d\n", nma->reg.nr_mode, nmb->reg.nr_mode);
 
 	if (producer_task_init(tska, nma))
@@ -1102,7 +1175,7 @@ static void __unused *producer_thread_fn(void *pargs)
 	return NULL;
 }
 
-static void print_pkt(const char *prefix, char *rxbuf, const char *msg,
+static void print_pkt(const char *prefix, const char *rxbuf, const char *msg,
 		      uint16_t rx_ring, uint16_t tx_ring, u_int len)
 {
 	struct ether_header *eh;

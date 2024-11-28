@@ -758,6 +758,7 @@ again:
 
 	/* poll() also cause kernel to txsync/rxsync the NICs */
 	ret = poll(pollfd, 2, 2500);
+	printf("n0 %d n1 %d ret %d\n", n0, n1, ret);
 #endif /* !defined(BUSYWAIT) */
 	if (ret <= 0)
 		DV("poll %s [0] ev %x %x rx %d@%d tx %d,"
@@ -835,6 +836,9 @@ static void init_producer_tasks(struct producer_task *tska, struct producer_task
 	args0.cp = &consumer_tsk->c_pa;
 	args1.prod = tskb;
 	args1.cp = &consumer_tsk->c_pb;
+
+	printf("%s: %p -> %p\n", __func__, nma->nifp->ni_name, nmb->nifp->ni_name);
+	printf("modes pa %d pb %d\n", nma->reg.nr_mode, nmb->reg.nr_mode);
 
 	if (producer_task_init(tska, nma))
 		die("unable to init prod task(pa): %s\n", strerror(errno));
@@ -967,6 +971,8 @@ static void threaded_producer(void *shdata, const char *ifa, const char *ifb,
 
 		targs.hw_port = pa;
 		targs.host_port = pb;
+
+		printf("%s: %s -> %s\n", __func__, pa->nifp->ni_name, pb->nifp->ni_name);
 
 		if (pthread_create(&threads[i], NULL, mq_bridge_pkts_thread, &targs))
 			die("failed to create producer netmap thread\n");
@@ -1635,26 +1641,11 @@ main(int argc, char **argv)
 
 	shmem = mem_init(nr_rings);
 #if 0
-	{
-		pthread_t th;
-		int ret;
-		struct producer_thread_args args = {
-			.shdata = shmem,
-			.ifa = ifa,
-			.ifb = ifb,
-			.nr_rings = nr_rings
-		};
-		ret = pthread_create(&th, NULL, producer_thread_fn, &args);
-		if (ret)
-			die("failed to create producer thread\n");
-	}
+	threaded_producer(shmem, ifa, ifb, nr_rings);
 #else
 	if (fork_or_die()) {
-		threaded_producer(shmem, ifa, ifb, nr_rings);
-	}
-	else
-#endif
-	{
+		multiproc_producer(shmem, ifa, ifb, nr_rings);
+	} else {
 		struct shm_struct *shm = shmem;
 
 		wait_event(shm->s_notifier.rn_ready,
@@ -1662,6 +1653,7 @@ main(int argc, char **argv)
 			   &shm->s_notifier.rn_ready_cond);
 		consumer_proc(shmem);
 	}
+#endif
 	mem_destroy(shmem, 4);
 
 	return (0);
